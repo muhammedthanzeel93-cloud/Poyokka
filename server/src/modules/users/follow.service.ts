@@ -1,5 +1,5 @@
 import { ClientSession } from 'mongoose';
-import { ACCOUNT_STATUSES, ACCOUNT_TYPES, FOLLOW_RULES } from '@kerala-tourism/constants';
+import { ACCOUNT_STATUSES, ACCOUNT_TYPES, FOLLOW_RULES, NOTIFICATION_TYPES } from '@kerala-tourism/constants';
 import {
   AuthenticatedPrincipal,
   FollowMutationResponseDto,
@@ -14,6 +14,7 @@ import { IAccountDocument } from '../../shared/models';
 import { AuthRepository, authRepository } from '../auth/auth.repository';
 import { verifyActiveTouristAccount } from '../posts/post.service';
 import { FollowRepository, followRepository } from './follow.repository';
+import { NotificationService, notificationService } from '../notifications/notification.service';
 import {
   FollowEdgeRecord,
   FollowListQuery,
@@ -24,6 +25,7 @@ export class FollowService {
   constructor(
     private repo: FollowRepository = followRepository,
     private authRepo: AuthRepository = authRepository,
+    private notifService: NotificationService = notificationService,
   ) {}
 
   public setRepository(repository: FollowRepository): void {
@@ -98,7 +100,7 @@ export class FollowService {
       ]);
     }
 
-    return this.repo.withTransaction(async (session) => {
+    const result = await this.repo.withTransaction(async (session) => {
       const target = await this.requireEligibleTargetTourist(targetUserId, session);
 
       const existing = await this.repo.findFollow(principal.id, target._id, session);
@@ -133,6 +135,20 @@ export class FollowService {
         },
       };
     });
+
+    await this.notifService.publishEvent({
+      callerAccountId: principal.id,
+      recipientAccountId: targetUserId,
+      notificationType: NOTIFICATION_TYPES.SOCIAL_NEW_FOLLOWER,
+      title: 'New Follower',
+      body: 'A traveler started following you.',
+      dataPayload: { route: 'user_profile', userId: principal.id },
+      relatedResourceType: 'ACCOUNT',
+      relatedResourceId: principal.id,
+      idempotencyKey: `evt_follow_${principal.id}_${targetUserId}`,
+    }).catch((err) => console.error('[Notification Publish Error]:', err));
+
+    return result;
   }
 
   /**

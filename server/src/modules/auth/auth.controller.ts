@@ -1,7 +1,7 @@
 import { Request, Response, NextFunction } from 'express';
 import { AuthService, authService } from './auth.service';
 import { env } from '../../config/env';
-import { UnauthorizedError } from '../../shared/errors/AppError';
+import { UnauthorizedError, ForbiddenError } from '../../shared/errors/AppError';
 
 export class AuthController {
   constructor(private readonly service: AuthService = authService) {}
@@ -84,9 +84,24 @@ export class AuthController {
   /**
    * Refreshes access token and rotates refresh token.
    * Reads refresh token from HttpOnly cookie or request body (for mobile apps).
+   * For cookie-based refresh, enforces CSRF defense by requiring custom header.
    */
   public refreshToken = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     try {
+      const hasCookieToken = Boolean(req.cookies?.refreshToken);
+      const hasExplicitToken = Boolean(req.body?.refreshToken || req.headers['x-refresh-token']);
+
+      // Defense in depth against CSRF for ambient browser cookie credentials
+      if (hasCookieToken && !hasExplicitToken) {
+        const csrfHeader = req.headers['x-requested-with'] || req.headers['x-csrf-token'];
+        if (!csrfHeader) {
+          throw new ForbiddenError(
+            'CSRF protection: Custom header (X-Requested-With or X-CSRF-Token) required for cookie-based token refresh',
+            'CSRF_HEADER_REQUIRED',
+          );
+        }
+      }
+
       const rawToken =
         req.cookies?.refreshToken ||
         req.body?.refreshToken ||

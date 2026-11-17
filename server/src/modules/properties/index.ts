@@ -1,7 +1,8 @@
-export * from './properties.types';
-export * from './properties.validation';
-export * from './properties.model';
-export * from './properties.repository';
-export * from './properties.service';
-export * from './properties.controller';
-export { default as propertiesRoutes } from './properties.routes';
+export * from './property.types';
+export * from './property.validation';
+export * from './property.model';
+export * from './property.repository';
+export * from './property.service';
+export * from './property.controller';
+export * from './property.routes';
+export { publicPropertyRoutes as propertiesRoutes } from './property.routes';

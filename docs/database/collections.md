@@ -196,23 +196,37 @@
 ---
 
 ### 6. `deviceTokens`
-- **Purpose**: Push notification registration tokens (FCM/APNS) for mobile devices.
+- **Purpose**: Mobile device registration tokens (FCM) for push notifications with automatic stale-token TTL eviction and invalid token self-healing.
 - **Fields**:
-  - `_id`: `ObjectId`
-  - `accountId`: `ObjectId` (Required, Ref: `accounts`)
-  - `token`: `String` (Required, unique push registration token)
-  - `platform`: `String` (Enum: `IOS`, `ANDROID`, `WEB`)
-  - `lastSeenAt`: `Date` (Target for 90-day stale token TTL cleanup)
-  - `createdAt`: `Date`
+  - `_id`: `ObjectId` (Primary Key)
+  - `accountId`: `ObjectId` (Required, Ref: `accounts`, indexed)
+  - `deviceToken`: `String` (Required, unique push registration token)
+  - `platform`: `String` (Enum: `IOS`, `ANDROID`)
+  - `provider`: `String` (Enum: `FCM`, default: `FCM`)
+  - `deviceId`: `String` (Optional hardware/client installation identifier)
+  - `isActive`: `Boolean` (Default: `true`, indexed)
+  - `lastSeenAt`: `Date` (Default: `Date.now`, target for 90-day stale token TTL cleanup)
+  - `invalidatedAt`: `Date` (Timestamp when invalidated by logout or provider rejection)
+  - `invalidReason`: `String` (e.g. `USER_UNREGISTERED`, `FCM_UNREGISTERED`)
+  - `createdAt`: `Date`, `updatedAt`: `Date`
+- **Indexes**:
+  - `{ deviceToken: 1 }` (Unique registration token)
+  - `{ accountId: 1, isActive: 1 }` (Active device token lookup by account)
+  - `{ lastSeenAt: 1 }` (90-day TTL cleanup index: `expireAfterSeconds: 7776000`)
 - **References**: Ref: `accounts._id`.
 - **Example Document**:
 ```json
 {
   "_id": { "$oid": "66e04d3e89a4b2c1d8e1f006" },
   "accountId": { "$oid": "66e04d3e89a4b2c1d8e1f001" },
-  "token": "fcm_token_98fa9f7a810f8a9e8b7...",
+  "deviceToken": "fcm_mobile_mock_android_1731835000000_a1b2c3d4",
   "platform": "ANDROID",
-  "lastSeenAt": { "$date": "2026-11-10T06:00:00Z" }
+  "provider": "FCM",
+  "deviceId": "dev_android_1731835000000",
+  "isActive": true,
+  "lastSeenAt": { "$date": "2026-11-17T09:00:00Z" },
+  "createdAt": { "$date": "2026-11-17T09:00:00Z" },
+  "updatedAt": { "$date": "2026-11-17T09:00:00Z" }
 }
 ```
 
@@ -662,32 +676,62 @@
 ## Domain 5: Travel Agencies & Curated Packages
 
 ### 22. `agencies`
-- **Purpose**: Licensed tour operator commercial profiles.
+- **Purpose**: Licensed travel agency and tour operator commercial profiles under the Split-Identity architecture.
 - **Fields**:
-  - `_id`: `ObjectId`
-  - `businessProfileId`: `ObjectId` (Required, Ref: `businessProfiles`, unique)
-  - `agencyName`: `String` (Required)
-  - `licenseNumber`: `String` (Required, Kerala Tourism Directorate License)
-  - `headquartersDistrict`: `String` (Required)
-  - `operatingSince`: `Int32` (Year established)
-  - `fleetTypes`: `Array<String>` (e.g. `["AC_SEDAN", "TEMPO_TRAVELER", "HOUSEBOAT"]`)
-  - `rating`: `Double` (Default `0.0`)
-  - `isEcoCertified`: `Boolean` (Default `false`)
+  - `_id`: `ObjectId` (Primary Key)
+  - `accountId`: `ObjectId` (Required, Ref: `accounts`, unique `idx_agencies_accountId_unique`)
+  - `businessProfileId`: `ObjectId` (Required, Ref: `businessProfiles`, unique `idx_agencies_businessProfileId_unique`)
+  - `agencyName`: `String` (Required, 2-100 characters)
+  - `registrationNumber`: `String` (Required, unique `idx_agencies_registrationNumber_unique`)
+  - `businessCategory`: `String` (Enum: `TOUR_OPERATOR`, `TRAVEL_AGENT`, `ACTIVITY_PROVIDER`, `TRANSPORT_OPERATOR`, `OTHER`)
+  - `description`: `String` (Required, 10-2000 characters)
+  - `contactEmail`: `String` (Required, lowercase)
+  - `contactPhone`: `String` (Required, E.164 format)
+  - `website`: `String` (Optional, valid URL)
+  - `address`: `String` (Required, 5-300 characters)
+  - `district`: `String` (Required, Kerala District)
+  - `state`: `String` (Default `Kerala`)
+  - `pinCode`: `String` (Required, 6-digit numeric string)
+  - `logoMediaId`: `ObjectId` (Optional, Ref: `media`)
+  - `verificationStatus`: `String` (Enum: `PENDING`, `UNDER_REVIEW`, `VERIFIED`, `REJECTED`, default `PENDING`)
+  - `reviewedBy`: `ObjectId` (Optional, Ref: `accounts`)
+  - `reviewedAt`: `Date` (Optional reviewer timestamp)
+  - `verifiedAt`: `Date` (Optional approval timestamp)
+  - `rejectionReason`: `String` (Mandatory when status is `REJECTED`)
+  - `documents`: `Array<Subdocument>` (Compliance documents with `_id`, `documentType`, `originalFileName`, `fileSize`, `mimeType`, `storageKey`, `uploadedAt`)
   - `createdAt`: `Date`, `updatedAt`: `Date`
-- **References**: Ref: `businessProfiles._id`.
+- **References**: Ref: `accounts._id`, `businessProfiles._id`, `media._id`.
 - **Example Document**:
 ```json
 {
   "_id": { "$oid": "66e04d3e89a4b2c1d8e1f022" },
+  "accountId": { "$oid": "66e04d3e89a4b2c1d8e1f001" },
   "businessProfileId": { "$oid": "66e04d3e89a4b2c1d8e1f003" },
   "agencyName": "Kerala Malabar Eco Trails",
-  "licenseNumber": "KTD-AGENCY-2024-91",
-  "headquartersDistrict": "Ernakulam",
-  "operatingSince": 2014,
-  "fleetTypes": ["AC_SEDAN", "TEMPO_TRAVELER"],
-  "rating": 4.92,
-  "isEcoCertified": true,
-  "createdAt": { "$date": "2026-05-01T00:00:00Z" }
+  "registrationNumber": "KTD-AGENCY-2026-91",
+  "businessCategory": "TOUR_OPERATOR",
+  "description": "Eco-friendly guided trekking and backwater tours across Malabar and Wayanad.",
+  "contactEmail": "info@malabarecotrails.com",
+  "contactPhone": "+919847012345",
+  "website": "https://www.malabarecotrails.com",
+  "address": "4th Floor, Tourism Complex, MG Road",
+  "district": "Ernakulam",
+  "state": "Kerala",
+  "pinCode": "682016",
+  "verificationStatus": "PENDING",
+  "documents": [
+    {
+      "_id": { "$oid": "66e04d3e89a4b2c1d8e1f099" },
+      "documentType": "BUSINESS_REGISTRATION",
+      "originalFileName": "kerala_gov_registration.pdf",
+      "fileSize": 1048576,
+      "mimeType": "application/pdf",
+      "storageKey": "vault/agencies/66e04d3e89a4b2c1d8e1f022/uuid-v4-file",
+      "uploadedAt": { "$date": "2026-11-13T04:30:00Z" }
+    }
+  ],
+  "createdAt": { "$date": "2026-11-13T04:30:00Z" },
+  "updatedAt": { "$date": "2026-11-13T04:30:00Z" }
 }
 ```
 
@@ -719,41 +763,89 @@
 ---
 
 ### 24. `travelPackages`
-- **Purpose**: Multi-day curated tour packages with day-by-day itineraries.
+- **Purpose**: Canonical travel package catalog representing multi-day curated tour packages with day-by-day itineraries, destinations, and pricing.
 - **Fields**:
-  - `_id`: `ObjectId`
-  - `agencyId`: `ObjectId` (Required, Ref: `agencies`)
-  - `title`: `String` (Required, e.g. `4D/3N Backwaters & Tea Trail`)
-  - `slug`: `String` (Required, unique)
-  - `durationDays`: `Int32` (Required)
-  - `durationNights`: `Int32` (Required)
-  - `basePricePerPerson`: `Double` (Required)
-  - `itinerary`: `Array<Object>` (Embedded: `[{ day: 1, title: "Fort Kochi Heritage", activities: [...] }]`)
-  - `inclusions`: `Array<String>` (e.g. `["AC Cab", "All Meals", "Houseboat Stay"]`)
-  - `exclusions`: `Array<String>` (e.g. `["Airfare", "Personal Expenses"]`)
-  - `maxGroupSize`: `Int32` (Default `15`)
-  - `isActive`: `Boolean` (Default `true`)
+  - `_id`: `ObjectId` (Primary key)
+  - `agencyId`: `ObjectId` (Required, Ref: `agencies`, immutable, indexed)
+  - `createdBy`: `ObjectId` (Required, Ref: `accounts`, immutable)
+  - `updatedBy`: `ObjectId` (Required, Ref: `accounts`)
+  - `title`: `String` (Required, min 3, max 120 chars, e.g. `4D/3N Backwaters & Tea Trail`)
+  - `slug`: `String` (Required, unique, lowercase, URL-friendly)
+  - `shortDescription`: `String` (Required, max 300 chars)
+  - `description`: `String` (Required, min 20, max 5000 chars)
+  - `packageCategory`: `String` (Required, enum: `BACKWATER`, `HILL_STATION`, `BEACH`, `AYURVEDA_WELLNESS`, `WILDLIFE`, `CULTURAL_HERITAGE`, `ADVENTURE`, `ECO_TOURISM`, `HONEYMOON`, `PILGRIMAGE`, `TOUR_OPERATOR`, `OTHER`)
+  - `tags`: `Array<String>` (Max 20 tags, lowercase)
+  - `destinationIds`: `Array<ObjectId>` (Ref: `destinations`)
+  - `startLocation`: `String` (Optional, max 120 chars)
+  - `endLocation`: `String` (Optional, max 120 chars)
+  - `itinerary`: `Array<Object>`:
+    - `dayNumber`: `Int32` (1-indexed, sequential)
+    - `title`: `String` (Required, max 120 chars)
+    - `description`: `String` (Required, max 2000 chars)
+    - `activities`: `Array<String>` (Max 20 activities per day)
+    - `destinationId`: `ObjectId` (Optional, Ref: `destinations`)
+    - `estimatedDuration`: `String` (Optional, max 100 chars)
+  - `durationDays`: `Int32` (Required, min 1, max 30)
+  - `durationNights`: `Int32` (Required, min 0, max 30)
+  - `inclusions`: `Array<String>` (Max 50 items, each max 200 chars)
+  - `exclusions`: `Array<String>` (Max 50 items, each max 200 chars)
+  - `importantInformation`: `String` (Optional, max 3000 chars)
+  - `cancellationPolicy`: `String` (Optional, max 2000 chars)
+  - `currency`: `String` (Default `INR`)
+  - `basePrice`: `Double` (Required, positive)
+  - `childPrice`: `Double` (Optional, positive)
+  - `groupPricing`: `Array<Object>` (`minPax`, `maxPax`, `pricePerPerson`)
+  - `pricingUnit`: `String` (Enum: `PER_PERSON`, `PER_COUPLE`, `PER_GROUP`, `PER_VEHICLE`, `PER_PACKAGE`, default `PER_PERSON`)
+  - `maxGroupSize`: `Int32` (Optional, positive)
+  - `coverMediaId`: `ObjectId` (Optional, Ref: `media`)
+  - `galleryMediaIds`: `Array<ObjectId>` (Max 10, Ref: `media`)
+  - `status`: `String` (Enum: `DRAFT`, `PENDING_REVIEW`, `PUBLISHED`, `REJECTED`, `ARCHIVED`, default `DRAFT`, indexed)
+  - `submittedAt`: `Date` (Optional)
+  - `publishedAt`: `Date` (Optional, indexed)
+  - `reviewedAt`: `Date` (Optional)
+  - `reviewedBy`: `ObjectId` (Optional, Ref: `accounts`)
+  - `rejectionReason`: `String` (Optional, mandatory when `status === 'REJECTED'`)
+  - `archivedAt`: `Date` (Optional)
   - `createdAt`: `Date`, `updatedAt`: `Date`
-- **References**: Ref: `agencies._id`.
+- **Indexes**:
+  - `idx_packages_slug`: `{ slug: 1 }` (Unique)
+  - `idx_packages_agency_status_created`: `{ agencyId: 1, status: 1, createdAt: -1 }` (Agency catalog listing & status filtering)
+  - `idx_packages_public_published`: `{ status: 1, publishedAt: -1, _id: -1 }` (Public newest feed)
+  - `idx_packages_public_category`: `{ status: 1, packageCategory: 1, publishedAt: -1 }` (Public category browsing)
+  - `idx_packages_public_price`: `{ status: 1, basePrice: 1, publishedAt: -1 }` (Price range discovery)
+  - `idx_packages_public_duration`: `{ status: 1, durationDays: 1, publishedAt: -1 }` (Duration discovery)
+  - `idx_packages_destinations`: `{ destinationIds: 1, status: 1 }` (Destination linkage)
+- **References**: Ref: `agencies._id`, `accounts._id`, `destinations._id`, `media._id`.
 - **Example Document**:
 ```json
 {
   "_id": { "$oid": "66e04d3e89a4b2c1d8e1f024" },
   "agencyId": { "$oid": "66e04d3e89a4b2c1d8e1f022" },
+  "createdBy": { "$oid": "66e04d3e89a4b2c1d8e1f010" },
+  "updatedBy": { "$oid": "66e04d3e89a4b2c1d8e1f010" },
   "title": "4D/3N Backwaters & Misty Munnar Trail",
   "slug": "4d-3n-backwaters-and-misty-munnar-trail",
+  "shortDescription": "Discover rolling tea plantations, pristine waterfalls, and misty peaks.",
+  "description": "Comprehensive four-day tour package taking travelers through Cheeyappara falls...",
+  "packageCategory": "HILL_STATION",
+  "tags": ["munnar", "tea-trail", "hills"],
+  "destinationIds": [{ "$oid": "66e04d3e89a4b2c1d8e1f005" }],
   "durationDays": 4,
   "durationNights": 3,
-  "basePricePerPerson": 14500.0,
+  "basePrice": 14500.0,
+  "currency": "INR",
+  "pricingUnit": "PER_PERSON",
   "itinerary": [
-    { "day": 1, "title": "Cochin Arrival & Heritage Walk", "activities": ["Dutch Palace", "Jew Town"] },
-    { "day": 2, "title": "Munnar Scenic Drive", "activities": ["Tea Terraces", "Cheeyappara Falls"] }
+    { "dayNumber": 1, "title": "Cochin Arrival & Heritage Walk", "activities": ["Dutch Palace", "Jew Town"], "description": "Arrival walk" },
+    { "dayNumber": 2, "title": "Munnar Scenic Drive", "activities": ["Tea Terraces", "Cheeyappara Falls"], "description": "Scenic drive" }
   ],
   "inclusions": ["AC Sedan Chauffeur", "Traditional Breakfast & Dinner", "Deluxe Tea Estate Stay"],
   "exclusions": ["Airfare to COK"],
   "maxGroupSize": 10,
-  "isActive": true,
-  "createdAt": { "$date": "2026-07-01T00:00:00Z" }
+  "status": "PUBLISHED",
+  "publishedAt": { "$date": "2026-11-13T10:00:00Z" },
+  "createdAt": { "$date": "2026-11-10T00:00:00Z" },
+  "updatedAt": { "$date": "2026-11-13T10:00:00Z" }
 }
 ```
 
@@ -814,47 +906,83 @@
 ## Domain 6: Accommodation & Dual-Mode Inventory
 
 ### 27. `properties`
-- **Purpose**: Hospitality establishment record (Homestays, Hotels, Eco-Resorts, Houseboats).
+- **Purpose**: Canonical hospitality property establishment records (Hotels, Resorts, Homestays, Villas, Guesthouses, Hostels, Houseboats) under the Split-Identity architecture.
 - **Fields**:
-  - `_id`: `ObjectId`
-  - `businessProfileId`: `ObjectId` (Required, Ref: `businessProfiles`)
-  - `name`: `String` (Required, e.g. `Kumarakom Lake Breeze Homestay`)
-  - `slug`: `String` (Required, unique)
-  - `propertyType`: `String` (Enum: `HOMESTAY`, `HOTEL`, `RESORT`, `HOUSEBOAT`)
-  - `district`: `String` (Required)
-  - `location`: `Object` (GeoJSON Point: `[longitude, latitude]`)
-  - `address`: `String` (Required)
-  - `images`: `Array<String>` (Media gallery)
-  - `supportsHourly`: `Boolean` (Enables day-use transit bookings, default `false`)
-  - `supportsDaily`: `Boolean` (Enables overnight stays, default `true`)
-  - `instantBookEnabled`: `Boolean` (If false, requires 15-minute host response)
-  - `checkInHourDaily`: `String` (Default `'12:00'`)
-  - `checkOutHourDaily`: `String` (Default `'11:00'`)
-  - `isVerified`: `Boolean` (Default `false`)
+  - `_id`: `ObjectId` (Primary key)
+  - `businessProfileId`: `ObjectId` (Required, Ref: `businessProfiles`, indexed)
+  - `accountId`: `ObjectId` (Required, Ref: `accounts`, indexed)
+  - `createdBy`: `ObjectId` (Required, Ref: `accounts`, immutable)
+  - `updatedBy`: `ObjectId` (Required, Ref: `accounts`)
+  - `name`: `String` (Required, min 2, max 150 chars, e.g. `Kumarakom Heritage Backwater Resort`)
+  - `slug`: `String` (Required, unique lowercase URL-safe slug)
+  - `propertyType`: `String` (Required, Enum: `HOTEL`, `RESORT`, `HOMESTAY`, `VILLA`, `GUESTHOUSE`, `HOSTEL`, `HOUSEBOAT`, `OTHER`)
+  - `shortDescription`: `String` (Optional, max 300 chars)
+  - `description`: `String` (Optional, max 5000 chars)
+  - `address`: `String` (Required, min 5 chars)
+  - `district`: `String` (Required, Kerala District)
+  - `city`: `String` (Optional)
+  - `state`: `String` (Default `'Kerala'`)
+  - `postalCode`: `String` (Optional, 6-digit numeric string)
+  - `location`: `Object` (GeoJSON Point: `coordinates: [longitude, latitude]`, 2dsphere indexed)
+  - `contactPhone`: `String` (Optional, E.164 format)
+  - `contactEmail`: `String` (Optional, lowercase email)
+  - `website`: `String` (Optional, valid URL)
+  - `facilities`: `Array<String>` (Validated against `PROPERTY_FACILITIES` constants)
+  - `coverMediaId`: `ObjectId` (Optional, Ref: `media`)
+  - `galleryMediaIds`: `Array<ObjectId>` (Max 15, Ref: `media`, no duplicates)
+  - `status`: `String` (Required, Enum: `DRAFT`, `PENDING_REVIEW`, `PUBLISHED`, `REJECTED`, `ARCHIVED`, default `DRAFT`)
+  - `submittedAt`: `Date` (Timestamp when submitted for admin review)
+  - `publishedAt`: `Date` (Timestamp when approved and published)
+  - `reviewedAt`: `Date` (Timestamp when admin decision rendered)
+  - `reviewedBy`: `ObjectId` (Ref: `accounts`, administrator who reviewed)
+  - `rejectionReason`: `String` (Mandatory on rejection, min 5, max 1000 chars)
+  - `archivedAt`: `Date` (Timestamp when soft-deleted/archived)
+  - `supportsHourly`: `Boolean` (Default `false`)
+  - `supportsDaily`: `Boolean` (Default `true`)
   - `createdAt`: `Date`, `updatedAt`: `Date`
-- **References**: Ref: `businessProfiles._id`.
+- **References**: Ref: `businessProfiles._id`, Ref: `accounts._id`, Ref: `media._id`.
 - **Example Document**:
 ```json
 {
   "_id": { "$oid": "66e04d3e89a4b2c1d8e1f027" },
   "businessProfileId": { "$oid": "66e04d3e89a4b2c1d8e1f003" },
-  "name": "Kumarakom Lake Breeze Homestay",
-  "slug": "kumarakom-lake-breeze-homestay",
-  "propertyType": "HOMESTAY",
+  "accountId": { "$oid": "66e04d3e89a4b2c1d8e1f001" },
+  "createdBy": { "$oid": "66e04d3e89a4b2c1d8e1f001" },
+  "updatedBy": { "$oid": "66e04d3e89a4b2c1d8e1f001" },
+  "name": "Kumarakom Heritage Backwater Resort",
+  "slug": "kumarakom-heritage-backwater-resort",
+  "propertyType": "RESORT",
+  "shortDescription": "Luxury backwater resort situated on the banks of Vembanad Lake.",
+  "description": "Experience traditional Kerala architecture with private plunge pools, Ayurvedic rejuvenation, and sunset boat cruises.",
+  "address": "Kavanattinkara Jetty Road, Kumarakom",
   "district": "Kottayam",
+  "city": "Kumarakom",
+  "state": "Kerala",
+  "postalCode": "686563",
   "location": {
     "type": "Point",
     "coordinates": [76.4281, 9.6178]
   },
-  "address": "Kavanattinkara Jetty Road, Kumarakom, Kottayam 686563",
-  "images": ["https://cdn.keralatourism.gov.in/stays/lake-breeze-1.jpg"],
-  "supportsHourly": true,
+  "contactPhone": "+919847012345",
+  "contactEmail": "reservations@kumarakomheritage.test",
+  "website": "https://kumarakomheritage.test",
+  "facilities": ["WIFI", "PARKING", "SWIMMING_POOL", "RESTAURANT", "AIR_CONDITIONING", "SPA"],
+  "coverMediaId": { "$oid": "66e04d3e89a4b2c1d8e1f050" },
+  "galleryMediaIds": [
+    { "$oid": "66e04d3e89a4b2c1d8e1f051" },
+    { "$oid": "66e04d3e89a4b2c1d8e1f052" }
+  ],
+  "status": "PUBLISHED",
+  "submittedAt": { "$date": "2026-11-13T10:00:00Z" },
+  "publishedAt": { "$date": "2026-11-13T12:00:00Z" },
+  "reviewedAt": { "$date": "2026-11-13T12:00:00Z" },
+  "reviewedBy": { "$oid": "66e04d3e89a4b2c1d8e1f999" },
+  "rejectionReason": null,
+  "archivedAt": null,
+  "supportsHourly": false,
   "supportsDaily": true,
-  "instantBookEnabled": true,
-  "checkInHourDaily": "12:00",
-  "checkOutHourDaily": "11:00",
-  "isVerified": true,
-  "createdAt": { "$date": "2026-08-15T00:00:00Z" }
+  "createdAt": { "$date": "2026-11-13T09:30:00Z" },
+  "updatedAt": { "$date": "2026-11-13T12:00:00Z" }
 }
 ```
 
@@ -915,63 +1043,100 @@
 
 ---
 
-### 30. `roomRates`
-- **Purpose**: Dual-mode pricing matrix defining daily rates and hourly transit blocks.
+### 30. `roomTypes`
+- **Purpose**: Canonical room type definition for accommodation properties (hotels, resorts, homestays, villas, etc.), holding capacity, facilities, pricing in integer paise, and configured units.
 - **Fields**:
   - `_id`: `ObjectId`
-  - `roomId`: `ObjectId` (Required, Ref: `rooms`, unique)
-  - `baseDailyOvernightRate`: `Double` (Required, e.g. `3200.00`)
-  - `hourlyRate3Hours`: `Double` (Rate for 3-hour day rest slot, e.g. `750.00`)
-  - `hourlyRate6Hours`: `Double` (Rate for 6-hour slot, e.g. `1350.00`)
-  - `hourlyRate12Hours`: `Double` (Rate for 12-hour day slot, e.g. `2200.00`)
+  - `propertyId`: `ObjectId` (Required, Ref: `properties`)
+  - `businessProfileId`: `ObjectId` (Required, Ref: `businessProfiles`)
+  - `accountId`: `ObjectId` (Required, Ref: `accounts`)
+  - `name`: `String` (Required, 2-100 chars)
+  - `slug`: `String` (Required, unique per property)
+  - `description`: `String` (Optional, max 2000 chars)
+  - `roomCategory`: `String` (Enum: `STANDARD`, `DELUXE`, `PREMIUM`, `SUITE`, `VILLA`, `STUDIO`, `DORMITORY`, `COTTAGE`, `OTHER`)
+  - `maxAdults`: `Int32` (Required, 1-20)
+  - `maxChildren`: `Int32` (Required, 0-20)
+  - `maxOccupancy`: `Int32` (Required, $\ge maxAdults$)
+  - `bedConfiguration`: `String` (Required, e.g. "1 King Bed")
+  - `bedCount`: `Int32` (Required, 1-20)
+  - `roomSize`: `Double` (Optional)
+  - `roomSizeUnit`: `String` (Enum: `SQ_FT`, `SQ_M`)
+  - `facilities`: `Array<String>` (Enum values from `ROOM_FACILITIES`)
+  - `basePrice`: `Int64` (Required, stored in integer paise: 1 INR = 100 paise)
   - `currency`: `String` (Default `'INR'`)
-  - `extraAdultCharge`: `Double` (Default `500.00`)
-  - `updatedAt`: `Date`
-- **References**: Ref: `rooms._id`.
+  - `pricingUnit`: `String` (Enum: `PER_NIGHT`, `PER_DAY`)
+  - `coverMediaId`: `ObjectId` (Optional, Ref: `media`)
+  - `galleryMediaIds`: `Array<ObjectId>` (Ref: `media`)
+  - `status`: `String` (Enum: `ACTIVE`, `INACTIVE`, `ARCHIVED`)
+  - `totalUnits`: `Int32` (Configured physical units, $\ge 1$)
+  - `createdAt`: `Date`, `updatedAt`: `Date`
+- **Indexes**:
+  - `{ propertyId: 1, status: 1 }`
+  - `{ businessProfileId: 1, status: 1 }`
+  - `{ propertyId: 1, slug: 1 }` (Unique, sparse)
 - **Example Document**:
 ```json
 {
   "_id": { "$oid": "66e04d3e89a4b2c1d8e1f030" },
-  "roomId": { "$oid": "66e04d3e89a4b2c1d8e1f029" },
-  "baseDailyOvernightRate": 3200.0,
-  "hourlyRate3Hours": 750.0,
-  "hourlyRate6Hours": 1350.0,
-  "hourlyRate12Hours": 2200.0,
+  "propertyId": { "$oid": "66e04d3e89a4b2c1d8e1f028" },
+  "businessProfileId": { "$oid": "66e04d3e89a4b2c1d8e1f005" },
+  "accountId": { "$oid": "66e04d3e89a4b2c1d8e1f002" },
+  "name": "Deluxe Sea View Suite",
+  "slug": "deluxe-sea-view-suite",
+  "description": "Luxurious beachfront suite with direct sea view.",
+  "roomCategory": "SUITE",
+  "maxAdults": 2,
+  "maxChildren": 2,
+  "maxOccupancy": 3,
+  "bedConfiguration": "1 King Bed",
+  "bedCount": 1,
+  "roomSize": 450.0,
+  "roomSizeUnit": "SQ_FT",
+  "facilities": ["WIFI", "AIR_CONDITIONING", "SEA_VIEW", "BALCONY"],
+  "basePrice": 650000,
   "currency": "INR",
-  "extraAdultCharge": 600.0,
-  "updatedAt": { "$date": "2026-11-01T00:00:00Z" }
+  "pricingUnit": "PER_NIGHT",
+  "status": "ACTIVE",
+  "totalUnits": 10,
+  "createdAt": { "$date": "2026-11-16T10:00:00Z" },
+  "updatedAt": { "$date": "2026-11-16T10:00:00Z" }
 }
 ```
 
 ---
 
 ### 31. `roomInventory`
-- **Purpose**: Daily status ledger for room availability, maintenance blocks, and holiday pricing surge.
+- **Purpose**: Daily calendar inventory ledger tracking sellable capacity, host holds, and maintenance blocks for each room type.
 - **Fields**:
   - `_id`: `ObjectId`
-  - `roomId`: `ObjectId` (Required, Ref: `rooms`)
-  - `date`: `Date` (UTC midnight representation of calendar date)
-  - `isBlocked`: `Boolean` (Maintenance or host personal use)
-  - `priceSurgeMultiplier`: `Double` (e.g. `1.25` for Onam peak week, default `1.0`)
-  - `allocatedIntervals`: `Array<Object>` (Allocated slot intervals: `[{ start: Date, end: Date, bookingId: ObjectId }]`)
+  - `propertyId`: `ObjectId` (Required, Ref: `properties`)
+  - `roomTypeId`: `ObjectId` (Required, Ref: `roomTypes`)
+  - `businessProfileId`: `ObjectId` (Required, Ref: `businessProfiles`)
+  - `date`: `Date` (Normalized UTC midnight representing calendar date in `Asia/Kolkata`)
+  - `totalUnits`: `Int32` (Configured capacity, $\ge 0$)
+  - `availableUnits`: `Int32` (Sellable units: $totalUnits - blockedUnits - maintenanceUnits$)
+  - `blockedUnits`: `Int32` (Host/VIP holds, $\ge 0$)
+  - `maintenanceUnits`: `Int32` (Out of service units, $\ge 0$)
   - `createdAt`: `Date`, `updatedAt`: `Date`
-- **Constraint**: Unique compound index `{ roomId: 1, date: 1 }`.
-- **References**: Ref: `rooms._id`.
+- **Indexes**:
+  - `{ roomTypeId: 1, date: 1 }` (Unique compound index)
+  - `{ propertyId: 1, date: 1 }`
+  - `{ businessProfileId: 1, date: 1 }`
+  - `{ roomTypeId: 1, date: 1, availableUnits: 1 }` (Covered lookup)
 - **Example Document**:
 ```json
 {
   "_id": { "$oid": "66e04d3e89a4b2c1d8e1f031" },
-  "roomId": { "$oid": "66e04d3e89a4b2c1d8e1f029" },
-  "date": { "$date": "2026-11-10T00:00:00Z" },
-  "isBlocked": false,
-  "priceSurgeMultiplier": 1.0,
-  "allocatedIntervals": [
-    {
-      "start": { "$date": "2026-11-10T06:30:00Z" },
-      "end": { "$date": "2026-11-10T10:30:00Z" },
-      "bookingId": { "$oid": "66e04d3e89a4b2c1d8e1f034" }
-    }
-  ]
+  "propertyId": { "$oid": "66e04d3e89a4b2c1d8e1f028" },
+  "roomTypeId": { "$oid": "66e04d3e89a4b2c1d8e1f030" },
+  "businessProfileId": { "$oid": "66e04d3e89a4b2c1d8e1f005" },
+  "date": { "$date": "2026-12-01T00:00:00Z" },
+  "totalUnits": 10,
+  "availableUnits": 8,
+  "blockedUnits": 1,
+  "maintenanceUnits": 1,
+  "createdAt": { "$date": "2026-11-16T10:00:00Z" },
+  "updatedAt": { "$date": "2026-11-16T10:00:00Z" }
 }
 ```
 
@@ -1026,67 +1191,112 @@
 ## Domain 7: Bookings, Concurrency & Financial Settlement
 
 ### 34. `bookings`
-- **Purpose**: Master reservation contract across hourly, daily, and package transactions.
+- **Purpose**: Master reservation contract across accommodation booking transactions.
 - **Fields**:
   - `_id`: `ObjectId`
-  - `bookingNumber`: `String` (Required, unique, e.g. `KL-BOOK-8821`)
-  - `touristId`: `ObjectId` (Required, Ref: `accounts`)
-  - `propertyId`: `ObjectId` (Optional Ref: `properties`)
-  - `roomId`: `ObjectId` (Optional Ref: `rooms`)
-  - `packageScheduleId`: `ObjectId` (Optional Ref: `packageSchedules`)
-  - `bookingMode`: `String` (Enum: `HOURLY`, `DAILY`, `TOUR_PACKAGE`)
-  - `checkInTime`: `Date` (Required UTC timestamp)
-  - `checkOutTime`: `Date` (Required UTC timestamp)
-  - `durationHours`: `Int32` (Optional: 3, 6, or 12 for hourly bookings)
-  - `guestsCount`: `Int32` (Required)
-  - `baseAmount`: `Double` (Required)
-  - `taxAmountGst`: `Double` (Kerala Luxury GST 12%)
-  - `ecoCessAmount`: `Double` (Kerala Eco-Conservation Cess 1%)
-  - `totalAmount`: `Double` (Total payable amount)
-  - `bookingStatus`: `String` (Enum: `PENDING_APPROVAL`, `CONFIRMED`, `CHECKED_IN`, `COMPLETED`, `CANCELLED`, `REJECTED`)
-  - `qrPassCode`: `String` (Encrypted digital pass hash)
-  - `isInstantBook`: `Boolean` (True if instant, false if 15-min host approval required)
-  - `approvalExpiresAt`: `Date` (15-min countdown deadline for request bookings)
+  - `bookingReference`: `String` (Required, unique, e.g. `KL-7F2A-4819`)
+  - `touristAccountId`: `ObjectId` (Required, Ref: `accounts`)
+  - `propertyId`: `ObjectId` (Required, Ref: `properties`)
+  - `roomTypeId`: `ObjectId` (Required, Ref: `roomTypes`)
+  - `businessProfileId`: `ObjectId` (Required, Ref: `businessProfiles`)
+  - `checkInDate`: `String` (Required, ISO date `YYYY-MM-DD`)
+  - `checkOutDate`: `String` (Required, ISO date `YYYY-MM-DD`)
+  - `numberOfRooms`: `Int32` (Required, 1-10)
+  - `adults`: `Int32` (Required, 1-30)
+  - `children`: `Int32` (Required, 0-30, default 0)
+  - `nights`: `Int32` (Required, 1-30)
+  - `status`: `String` (Enum: `AWAITING_PAYMENT`, `CONFIRMED`, `CHECKED_IN`, `COMPLETED`, `CANCELLED`, `EXPIRED`, `REJECTED`)
+  - `holdId`: `ObjectId` (Optional Ref: `inventoryHolds`)
+  - `priceSnapshot`: `Object` (Required, immutable integer paise breakdown)
+    - `basePricePaise`: `Int64`, `basePriceInr`: `Double`
+    - `numberOfRooms`: `Int32`, `numberOfNights`: `Int32`
+    - `dailyBreakdown`: `Array<{ date: String, pricePaise: Int64, priceInr: Double }>`
+    - `subtotalPaise`: `Int64`, `subtotalInr`: `Double`
+    - `taxesPaise`: `Int64`, `taxesInr`: `Double`
+    - `totalPaise`: `Int64`, `totalInr`: `Double`, `currency`: `String`
+  - `guestDetails`: `Object` (Required, primary guest name, email, phone, special requests)
   - `createdAt`: `Date`, `updatedAt`: `Date`
-- **References**: Ref: `accounts._id`, Ref: `properties._id`, Ref: `rooms._id`, Ref: `packageSchedules._id`.
+- **References**: Ref: `accounts._id`, Ref: `properties._id`, Ref: `roomTypes._id`, Ref: `businessProfiles._id`, Ref: `inventoryHolds._id`.
 - **Example Document**:
 ```json
 {
   "_id": { "$oid": "66e04d3e89a4b2c1d8e1f034" },
-  "bookingNumber": "KL-BOOK-8821",
-  "touristId": { "$oid": "66e04d3e89a4b2c1d8e1f001" },
+  "bookingReference": "KL-7F2A-4819",
+  "touristAccountId": { "$oid": "66e04d3e89a4b2c1d8e1f001" },
   "propertyId": { "$oid": "66e04d3e89a4b2c1d8e1f027" },
-  "roomId": { "$oid": "66e04d3e89a4b2c1d8e1f029" },
-  "bookingMode": "HOURLY",
-  "checkInTime": { "$date": "2026-11-10T08:30:00Z" },
-  "checkOutTime": { "$date": "2026-11-10T11:30:00Z" },
-  "durationHours": 3,
-  "guestsCount": 2,
-  "baseAmount": 750.0,
-  "taxAmountGst": 90.0,
-  "ecoCessAmount": 7.5,
-  "totalAmount": 847.5,
-  "bookingStatus": "CONFIRMED",
-  "qrPassCode": "QR-KL-PASS-a7f9b8c0e1",
-  "isInstantBook": true,
-  "createdAt": { "$date": "2026-11-10T08:00:00Z" }
+  "roomTypeId": { "$oid": "66e04d3e89a4b2c1d8e1f029" },
+  "businessProfileId": { "$oid": "66e04d3e89a4b2c1d8e1f010" },
+  "checkInDate": "2026-12-01",
+  "checkOutDate": "2026-12-04",
+  "numberOfRooms": 2,
+  "adults": 4,
+  "children": 0,
+  "nights": 3,
+  "status": "AWAITING_PAYMENT",
+  "holdId": { "$oid": "66e04d3e89a4b2c1d8e1f035" },
+  "priceSnapshot": {
+    "basePricePaise": 500000,
+    "basePriceInr": 5000,
+    "numberOfRooms": 2,
+    "numberOfNights": 3,
+    "dailyBreakdown": [
+      { "date": "2026-12-01", "pricePaise": 500000, "priceInr": 5000 },
+      { "date": "2026-12-02", "pricePaise": 500000, "priceInr": 5000 },
+      { "date": "2026-12-03", "pricePaise": 500000, "priceInr": 5000 }
+    ],
+    "subtotalPaise": 3000000,
+    "subtotalInr": 30000,
+    "taxesPaise": 0,
+    "taxesInr": 0,
+    "totalPaise": 3000000,
+    "totalInr": 30000,
+    "currency": "INR"
+  },
+  "guestDetails": {
+    "primaryGuestName": "Anoop Nair",
+    "email": "anoop.nair@example.com",
+    "phone": "+919876543210",
+    "specialRequests": "Quiet floor"
+  },
+  "createdAt": { "$date": "2026-11-16T15:00:00Z" },
+  "updatedAt": { "$date": "2026-11-16T15:00:00Z" }
 }
 ```
 
 ---
 
 ### 35. `inventoryHolds`
-- **Purpose**: High-concurrency temporary reservation hold (15-minute TTL) protecting rooms during checkout.
+- **Purpose**: High-concurrency temporary reservation hold (15-minute validity window) protecting rooms during checkout.
 - **Fields**:
   - `_id`: `ObjectId`
-  - `roomId`: `ObjectId` (Required, Ref: `rooms`)
-  - `touristId`: `ObjectId` (Required, Ref: `accounts`)
-  - `holdStartTime`: `Date` (Required UTC timestamp)
-  - `holdEndTime`: `Date` (Required UTC timestamp including 60-min housekeeping buffer)
-  - `idempotencyKey`: `String` (Required unique client request token)
-  - `expiresAt`: `Date` (Required TTL index target, 15 minutes from creation)
-  - `createdAt`: `Date`
-- **Constraint**: Unique index on `idempotencyKey`, TTL on `expiresAt`.
+  - `bookingId`: `ObjectId` (Required, unique, Ref: `bookings`)
+  - `roomTypeId`: `ObjectId` (Required, Ref: `roomTypes`)
+  - `propertyId`: `ObjectId` (Required, Ref: `properties`)
+  - `businessProfileId`: `ObjectId` (Required, Ref: `businessProfiles`)
+  - `touristAccountId`: `ObjectId` (Required, Ref: `accounts`)
+  - `numberOfRooms`: `Int32` (Required, min 1)
+  - `stayDates`: `Array<String>` (Required, ['YYYY-MM-DD', ...])
+  - `status`: `String` (Enum: `ACTIVE`, `CONSUMED`, `RELEASED`, `EXPIRED`)
+  - `expiresAt`: `Date` (Required, 15 minutes from creation)
+  - `createdAt`: `Date`, `updatedAt`: `Date`
+- **Constraint**: Unique index on `bookingId`, compound index on `{ status: 1, expiresAt: 1 }`, 7-day TTL on `expiresAt` for disk pruning.
+
+---
+
+### 36. `idempotencyKeys`
+- **Purpose**: Client request deduplication ensuring safe retries for hold creation and bookings.
+- **Fields**:
+  - `_id`: `ObjectId`
+  - `touristAccountId`: `ObjectId` (Required, Ref: `accounts`)
+  - `key`: `String` (Required, client `Idempotency-Key` header)
+  - `requestHash`: `String` (Required, SHA-256 hash of payload)
+  - `responseStatus`: `Int32` (Required, HTTP status code)
+  - `responseBody`: `Mixed` (Required, cached response payload)
+  - `bookingId`: `ObjectId` (Optional Ref: `bookings`)
+  - `holdId`: `ObjectId` (Optional Ref: `inventoryHolds`)
+  - `expiresAt`: `Date` (Required, 24 hours from creation)
+  - `createdAt`: `Date`, `updatedAt`: `Date`
+- **Constraint**: Unique compound index `{ touristAccountId: 1, key: 1 }`, TTL on `expiresAt` (`expireAfterSeconds: 0`).
 - **References**: Ref: `rooms._id`, Ref: `accounts._id`.
 - **Example Document**:
 ```json
@@ -1193,40 +1403,79 @@
 ---
 
 ### 39. `payments`
-- **Purpose**: External payment gateway transaction logs (UPI, NetBanking, Cards).
+- **Purpose**: Internal payment transaction records and gateway order/payment tracking.
 - **Fields**:
   - `_id`: `ObjectId`
+  - `paymentReference`: `String` (Required, Unique, e.g. `'PAY-20261117-9A1B2C'`)
   - `bookingId`: `ObjectId` (Required, Ref: `bookings`)
-  - `gatewayTransactionId`: `String` (Required, unique provider transaction reference)
-  - `paymentGateway`: `String` (Enum: `RAZORPAY`, `CASHFREE`, `UPI_DIRECT`)
-  - `amount`: `Double` (Required)
+  - `holdId`: `ObjectId` (Required, Ref: `inventoryHolds`)
+  - `touristAccountId`: `ObjectId` (Required, Ref: `accounts`)
+  - `businessProfileId`: `ObjectId` (Required, Ref: `businessProfiles`)
+  - `provider`: `String` (Enum: `'RAZORPAY'`, Required)
+  - `providerOrderId`: `String` (e.g. `'order_O8x9y7z6a5b4c3'`)
+  - `providerPaymentId`: `String` (e.g. `'pay_P1q2w3e4r5t6y7'`)
+  - `amountPaise`: `Number` (Required, Integer paise: 1 INR = 100 paise)
   - `currency`: `String` (Default `'INR'`)
-  - `paymentMethod`: `String` (Enum: `UPI`, `CARD`, `NETBANKING`, `PAY_AT_PROPERTY`)
-  - `status`: `String` (Enum: `AUTHORIZED`, `CAPTURED`, `FAILED`, `HELD_IN_ESCROW`, `REFUNDED`)
-  - `escrowReleaseDueAt`: `Date` (2 hours post-check-in release timestamp)
-  - `isEscrowReleased`: `Boolean` (Default `false`)
+  - `status`: `String` (Enum: `'CREATED'`, `'PENDING'`, `'AUTHORIZED'`, `'CAPTURED'`, `'FAILED'`, `'CANCELLED'`, `'REFUND_PENDING'`, `'REFUNDED'`)
+  - `failureCode`: `String`
+  - `failureDescription`: `String`
+  - `reconciliationStatus`: `String` (`'FLAGGED_FOR_MANUAL_REVIEW'`)
+  - `paidAt`: `Date`
   - `createdAt`: `Date`, `updatedAt`: `Date`
-- **References**: Ref: `bookings._id`.
+- **Indexes**:
+  - `{ paymentReference: 1 }` (unique)
+  - `{ bookingId: 1, createdAt: -1 }`
+  - `{ touristAccountId: 1, createdAt: -1 }`
+  - `{ provider: 1, providerOrderId: 1 }`
+  - `{ provider: 1, providerPaymentId: 1 }`
+  - `{ status: 1 }`
 - **Example Document**:
 ```json
 {
-  "_id": { "$oid": "66e04d3e89a4b2c1d8e1f039" },
-  "bookingId": { "$oid": "66e04d3e89a4b2c1d8e1f034" },
-  "gatewayTransactionId": "pay_O9a8b7c6d5e4f3",
-  "paymentGateway": "RAZORPAY",
-  "amount": 847.5,
+  "_id": { "$oid": "673752e5058a98f1d2c10001" },
+  "paymentReference": "PAY-20261117-9A1B2C",
+  "bookingId": { "$oid": "673752e5058a98f1d2c10002" },
+  "holdId": { "$oid": "673752e5058a98f1d2c10003" },
+  "touristAccountId": { "$oid": "673752e5058a98f1d2c10004" },
+  "businessProfileId": { "$oid": "673752e5058a98f1d2c10005" },
+  "provider": "RAZORPAY",
+  "providerOrderId": "order_O8x9y7z6a5b4c3",
+  "providerPaymentId": "pay_P1q2w3e4r5t6y7",
+  "amountPaise": 1500000,
   "currency": "INR",
-  "paymentMethod": "UPI",
-  "status": "HELD_IN_ESCROW",
-  "escrowReleaseDueAt": { "$date": "2026-11-10T10:30:00Z" },
-  "isEscrowReleased": false,
-  "createdAt": { "$date": "2026-11-10T08:02:00Z" }
+  "status": "CAPTURED",
+  "paidAt": { "$date": "2026-11-17T09:05:00.000Z" },
+  "createdAt": { "$date": "2026-11-17T09:00:00.000Z" }
 }
 ```
 
 ---
 
-### 40. `refunds`
+### 40. `paymentWebhookEvents`
+- **Purpose**: Ingested gateway webhook notifications for cryptographic audit trail and idempotent deduplication.
+- **Fields**:
+  - `_id`: `ObjectId`
+  - `provider`: `String` (Enum: `'RAZORPAY'`, Required)
+  - `providerEventId`: `String` (Required, Provider event ID, e.g. `'evt_O9x8y7z6a5b4c3'`)
+  - `eventType`: `String` (Required, e.g. `'payment.captured'`)
+  - `paymentId`: `ObjectId` (Ref: `payments`)
+  - `providerPaymentId`: `String`
+  - `providerOrderId`: `String`
+  - `payloadHash`: `String` (Required, SHA-256 hash of raw incoming request body)
+  - `processingStatus`: `String` (Enum: `'RECEIVED'`, `'PROCESSED'`, `'IGNORED'`, `'FAILED'`)
+  - `receivedAt`: `Date` (Default `Date.now`)
+  - `processedAt`: `Date`
+  - `failureCode`: `String`
+  - `createdAt`: `Date`, `updatedAt`: `Date`
+- **Indexes**:
+  - `{ provider: 1, providerEventId: 1 }` (unique)
+  - `{ processingStatus: 1, receivedAt: 1 }`
+  - `{ providerPaymentId: 1 }`
+  - `{ createdAt: 1 }` with `expireAfterSeconds: 2592000` (30 days TTL)
+
+---
+
+### 41. `refunds`
 - **Purpose**: Financial reversal records processed back to the traveler's source payment account.
 - **Fields**:
   - `_id`: `ObjectId`
@@ -1430,16 +1679,24 @@
 ---
 
 ### 47. `notifications`
-- **Purpose**: System alerts (Booking confirmed, 15-min countdown, Admin approval).
+- **Purpose**: Authoritative in-app notification tray records delivering booking, payment, and social updates.
 - **Fields**:
-  - `_id`: `ObjectId`
-  - `recipientAccountId`: `ObjectId` (Required, Ref: `accounts`)
-  - `notificationType`: `String` (Enum: `BOOKING_CONFIRMED`, `KYC_APPROVED`, `NEW_FOLLOWER`, `OFFER_RECEIVED`)
-  - `title`: `String` (Required)
-  - `body`: `String` (Required)
-  - `deepLinkRoute`: `String` (e.g. `/my-bookings?id=KL-BOOK-8821`)
-  - `isRead`: `Boolean` (Default `false`)
-  - `createdAt`: `Date`
+  - `_id`: `ObjectId` (Primary Key)
+  - `recipientAccountId`: `ObjectId` (Required, Ref: `accounts`, indexed)
+  - `notificationType`: `String` (Enum: `BOOKING_CONFIRMED`, `BOOKING_CANCELLED`, `BOOKING_REJECTED`, `PAYMENT_CAPTURED`, `PAYMENT_FAILED`, `PAYMENT_RECONCILIATION_REQUIRED`, `SOCIAL_NEW_FOLLOWER`, `SOCIAL_COMMENT`, `SOCIAL_LIKE`)
+  - `title`: `String` (Required, max 150 chars, trimmed)
+  - `body`: `String` (Required, max 500 chars, trimmed)
+  - `dataPayload`: `Map<String, String>` (Safe routing parameters, e.g. `{ route: "booking_details", bookingId: "bk_123" }`)
+  - `relatedResourceType`: `String` (Enum: `BOOKING`, `PAYMENT`, `POST`, `ACCOUNT`)
+  - `relatedResourceId`: `String` (ID of associated resource)
+  - `isRead`: `Boolean` (Default: `false`, indexed)
+  - `readAt`: `Date` (Timestamp when notification was marked as read, nullable)
+  - `deliveryStatus`: `String` (Enum: `PENDING`, `DELIVERED`, `FAILED`, default: `PENDING`)
+  - `createdAt`: `Date`, `updatedAt`: `Date`
+- **Indexes**:
+  - `{ recipientAccountId: 1, createdAt: -1, _id: -1 }` (Recipient reverse-chronological list)
+  - `{ recipientAccountId: 1, isRead: 1, createdAt: -1 }` (Unread badge counts & filtering)
+  - `{ relatedResourceType: 1, relatedResourceId: 1 }` (Sparse resource reverse lookup)
 - **References**: Ref: `accounts._id`.
 - **Example Document**:
 ```json
@@ -1447,11 +1704,91 @@
   "_id": { "$oid": "66e04d3e89a4b2c1d8e1f047" },
   "recipientAccountId": { "$oid": "66e04d3e89a4b2c1d8e1f001" },
   "notificationType": "BOOKING_CONFIRMED",
-  "title": "Hourly Room Confirmed",
-  "body": "Kumarakom Lake Breeze Homestay confirmed your 3-hour transit slot.",
-  "deepLinkRoute": "/my-bookings?id=KL-BOOK-8821",
+  "title": "Booking Confirmed!",
+  "body": "Your stay at Wayanad Tea Estate Villa has been confirmed.",
+  "dataPayload": {
+    "route": "booking_details",
+    "bookingId": "bk_66e04d3e89a4b2c1d8e1f077"
+  },
+  "relatedResourceType": "BOOKING",
+  "relatedResourceId": "bk_66e04d3e89a4b2c1d8e1f077",
   "isRead": false,
-  "createdAt": { "$date": "2026-11-10T08:02:00Z" }
+  "readAt": null,
+  "deliveryStatus": "DELIVERED",
+  "createdAt": { "$date": "2026-11-17T09:00:00Z" },
+  "updatedAt": { "$date": "2026-11-17T09:00:00Z" }
+}
+```
+
+---
+
+### 48. `notificationOutbox`
+- **Purpose**: Durable transaction-decoupled outbox queue ensuring at-least-once push notification delivery with idempotency deduplication and bounded exponential backoff retries.
+- **Fields**:
+  - `_id`: `ObjectId` (Primary Key)
+  - `notificationId`: `ObjectId` (Required, Ref: `notifications`)
+  - `recipientAccountId`: `ObjectId` (Required, Ref: `accounts`)
+  - `idempotencyKey`: `String` (Required, unique business deduplication key, e.g. `evt_booking_confirmed_bk_123`)
+  - `eventType`: `String` (Enum: `NOTIFICATION_TYPES`)
+  - `payload`: `Object` (`{ title: String, body: String, data?: Record<String, String> }`)
+  - `status`: `String` (Enum: `PENDING`, `PROCESSING`, `DELIVERED`, `FAILED`, `DEAD_LETTER`, default: `PENDING`, indexed)
+  - `attempts`: `Number` (Delivery attempt counter, default: `0`)
+  - `maxAttempts`: `Number` (Maximum retry attempts before dead-letter, default: `5`)
+  - `nextRetryAt`: `Date` (Timestamp scheduled for next delivery attempt, default: `Date.now`, indexed)
+  - `lastError`: `String` (Error message from provider upon failure, optional)
+  - `processedAt`: `Date` (Timestamp when delivery completed or transitioned to dead-letter, optional)
+  - `createdAt`: `Date`, `updatedAt`: `Date`
+- **Indexes**:
+  - `{ idempotencyKey: 1 }` (Unique business event deduplication invariant)
+  - `{ status: 1, nextRetryAt: 1 }` (Worker polling queue index)
+  - `{ createdAt: 1 }` (30-day purge TTL: `expireAfterSeconds: 2592000`)
+- **References**: Ref: `notifications._id`, Ref: `accounts._id`.
+- **Example Document**:
+```json
+{
+  "_id": { "$oid": "66e04d3e89a4b2c1d8e1f048" },
+  "notificationId": { "$oid": "66e04d3e89a4b2c1d8e1f047" },
+  "recipientAccountId": { "$oid": "66e04d3e89a4b2c1d8e1f001" },
+  "idempotencyKey": "evt_booking_confirmed_bk_66e04d3e89a4b2c1d8e1f077",
+  "eventType": "BOOKING_CONFIRMED",
+  "payload": {
+    "title": "Booking Confirmed!",
+    "body": "Your stay at Wayanad Tea Estate Villa has been confirmed.",
+    "data": { "route": "booking_details", "bookingId": "bk_66e04d3e89a4b2c1d8e1f077" }
+  },
+  "status": "DELIVERED",
+  "attempts": 1,
+  "maxAttempts": 5,
+  "nextRetryAt": { "$date": "2026-11-17T09:00:00Z" },
+  "processedAt": { "$date": "2026-11-17T09:00:02Z" },
+  "createdAt": { "$date": "2026-11-17T09:00:00Z" }
+}
+```
+
+---
+
+### 49. `notificationPreferences`
+- **Purpose**: Per-tourist category notification controls and opt-out preferences.
+- **Fields**:
+  - `_id`: `ObjectId` (Primary Key)
+  - `accountId`: `ObjectId` (Required, unique, Ref: `accounts`, indexed)
+  - `bookingUpdates`: `Boolean` (Default: `true`)
+  - `paymentUpdates`: `Boolean` (Default: `true`)
+  - `socialUpdates`: `Boolean` (Default: `true`)
+  - `createdAt`: `Date`, `updatedAt`: `Date`
+- **Indexes**:
+  - `{ accountId: 1 }` (Unique account preference lookup)
+- **References**: Ref: `accounts._id`.
+- **Example Document**:
+```json
+{
+  "_id": { "$oid": "66e04d3e89a4b2c1d8e1f049" },
+  "accountId": { "$oid": "66e04d3e89a4b2c1d8e1f001" },
+  "bookingUpdates": true,
+  "paymentUpdates": true,
+  "socialUpdates": false,
+  "createdAt": { "$date": "2026-11-17T09:00:00Z" },
+  "updatedAt": { "$date": "2026-11-17T09:00:00Z" }
 }
 ```
 

@@ -34,13 +34,15 @@ export class PostsRepository {
     includeDeleted = false,
   ): Promise<IPostDocument | null> {
     if (includeDeleted) {
-      return PostModel.findById(id);
+      return PostModel.findById(id).lean<IPostDocument>().exec();
     }
     return PostModel.findOne({
       _id: new Types.ObjectId(id.toString()),
       deletedAt: null,
       status: { $ne: POST_STATUSES.REMOVED },
-    });
+    })
+      .lean<IPostDocument>()
+      .exec();
   }
 
   /**
@@ -52,7 +54,9 @@ export class PostsRepository {
       visibility: POST_VISIBILITIES.PUBLIC,
       status: POST_STATUSES.PUBLISHED,
       deletedAt: null,
-    });
+    })
+      .lean<IPostDocument>()
+      .exec();
   }
 
   /**
@@ -75,8 +79,10 @@ export class PostsRepository {
       PostModel.find(filter)
         .sort({ publishedAt: -1, _id: -1 })
         .skip((options.page - 1) * options.limit)
-        .limit(options.limit),
-      PostModel.countDocuments(filter),
+        .limit(options.limit)
+        .lean<IPostDocument[]>()
+        .exec(),
+      PostModel.countDocuments(filter).exec(),
     ]);
 
     return { items, total };
@@ -107,8 +113,10 @@ export class PostsRepository {
       PostModel.find(filter)
         .sort({ createdAt: -1, _id: -1 })
         .skip((options.page - 1) * options.limit)
-        .limit(options.limit),
-      PostModel.countDocuments(filter),
+        .limit(options.limit)
+        .lean<IPostDocument[]>()
+        .exec(),
+      PostModel.countDocuments(filter).exec(),
     ]);
 
     return { items, total };

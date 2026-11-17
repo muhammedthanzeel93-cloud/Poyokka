@@ -119,7 +119,7 @@ export class AuthorizationController {
       }
 
       // Assert ownership: conceal with 404 if requested by another business
-      assertOwnership(property.ownerId, req.user!.id, {
+      assertOwnership((property.ownerId || property.accountId)!, req.user!.id, {
         resourceName: 'Property',
         concealWithNotFound: true,
       });
@@ -164,7 +164,7 @@ export class AuthorizationController {
         throw new NotFoundError('Booking not found', 'RESOURCE_NOT_FOUND');
       }
 
-      assertOwnership(property.ownerId, req.user!.id, {
+      assertOwnership((property.ownerId || property.accountId)!, req.user!.id, {
         resourceName: 'Booking',
         concealWithNotFound: true,
       });

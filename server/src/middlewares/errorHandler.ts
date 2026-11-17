@@ -8,7 +8,7 @@ export { AppError };
 
 export const errorHandler = (
   err: Error | AppError | ZodError,
-  _req: Request,
+  req: Request,
   res: Response<ApiErrorResponse>,
   _next: NextFunction,
 ): void => {
@@ -40,7 +40,7 @@ export const errorHandler = (
         : 'Internal Server Error';
 
   if (!isAppError || !err.isOperational) {
-    console.error('[Unhandled Server Error]:', err);
+    console.error(`[Unhandled Server Error] [Request ID: ${req.id || '-'}]`, err);
   }
 
   res.status(statusCode).json({

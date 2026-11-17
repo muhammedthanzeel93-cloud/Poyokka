@@ -1,4 +1,5 @@
 import { HealthResponse } from './health.types';
+import { HealthDatabaseStatus } from '../../shared/types';
 import { db } from '../../config/database';
 import { env } from '../../config/env';
 
@@ -19,6 +20,30 @@ export class HealthService {
       services: {
         api: 'up',
       },
+    };
+  }
+
+  public getLiveness(): { status: string; timestamp: string; uptime: number } {
+    return {
+      status: 'ok',
+      timestamp: new Date().toISOString(),
+      uptime: Math.round(process.uptime()),
+    };
+  }
+
+  public getReadiness(): {
+    isReady: boolean;
+    status: string;
+    database: HealthDatabaseStatus;
+    timestamp: string;
+  } {
+    const dbStatus = db.getSafeStatus();
+    const isReady = dbStatus.status === 'connected';
+    return {
+      isReady,
+      status: isReady ? 'ready' : 'not_ready',
+      database: dbStatus,
+      timestamp: new Date().toISOString(),
     };
   }
 }

@@ -257,8 +257,12 @@ describe('Day 17 Admin Dashboard & User Management Replica Set Integration Tests
       });
     }
 
-    if (tmpDbPath) {
-      fs.rmSync(tmpDbPath, { recursive: true, force: true });
+    if (tmpDbPath && fs.existsSync(tmpDbPath)) {
+      try {
+        fs.rmSync(tmpDbPath, { recursive: true, force: true });
+      } catch {
+        // Ignored on Windows file lock
+      }
     }
   });
 

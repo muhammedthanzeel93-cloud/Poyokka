@@ -9,7 +9,9 @@
     "android": "expo start --android",
     "ios": "expo start --ios",
     "web": "expo start --web",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src --ext .ts,.tsx",
+    "test": "tsx --test src/tests/**/*.test.ts"
   },
   "dependencies": {
     "@kerala-tourism/api-client": "*",

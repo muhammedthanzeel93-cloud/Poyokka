@@ -36,8 +36,9 @@ Every index in MongoDB incurs a RAM overhead in WiredTiger cache and a write lat
 | `sessions` | `{ expiresAt: 1 }` | TTL Index | `expireAfterSeconds: 0` | Automated session cleanup upon expiration |
 | `sessions` | `{ accountId: 1, isRevoked: 1 }` | Compound | None | Active user sessions check |
 | `sessions` | `{ refreshTokenHash: 1 }` | Unique | None | Session token refresh & rotation |
+| `deviceTokens` | `{ deviceToken: 1 }` | Unique | None | Avoid duplicate device push token registrations across all accounts |
+| `deviceTokens` | `{ accountId: 1, isActive: 1 }` | Compound | None | Active device tokens lookup for recipient account during push delivery |
 | `deviceTokens` | `{ lastSeenAt: 1 }` | TTL Index | `expireAfterSeconds: 7776000` (90 days) | Auto-prune inactive push notification tokens |
-| `deviceTokens` | `{ accountId: 1, token: 1 }` | Unique | None | Avoid duplicate push token registrations |
 
 ---
 
@@ -99,12 +100,19 @@ Every index in MongoDB incurs a RAM overhead in WiredTiger cache and a write lat
 
 | Collection | Index Keys | Type | Partial Filter / Options | Query Supported |
 |---|---|---|---|---|
-| `agencies` | `{ businessProfileId: 1 }` | Unique | None | 1:1 business profile mapping |
-| `agencies` | `{ licenseNumber: 1 }` | Unique | None | Directorate license validation |
+| `agencies` | `{ accountId: 1 }` | Unique | None | 1:1 business account agency identity mapping |
+| `agencies` | `{ registrationNumber: 1 }` | Unique | None | Directorate registration number uniqueness |
+| `agencies` | `{ verificationStatus: 1, createdAt: -1, _id: -1 }` | Compound | `name: 'idx_agencies_status_created'` | Admin verification triage queues (newest-first) |
+| `agencies` | `{ district: 1, verificationStatus: 1 }` | Compound | `name: 'idx_agencies_district_status'` | Regional administrative filtering |
+| `agencies` | `{ createdAt: -1, _id: -1 }` | Compound | `name: 'idx_agencies_created'` | Global chronological listing and pagination |
 | `agencyDocuments` | `{ agencyId: 1, docType: 1 }` | Compound | None | Compliance document inspections |
-| `travelPackages` | `{ slug: 1 }` | Unique | None | Package details URL routing |
-| `travelPackages` | `{ agencyId: 1, isActive: 1 }` | Compound | None | Agency active catalog listing |
-| `travelPackages` | `{ durationDays: 1, basePricePerPerson: 1 }` | Compound | None | Package multi-filter search |
+| `travelPackages` | `{ slug: 1 }` | Unique | `name: 'idx_packages_slug'` | Package details SEO URL routing |
+| `travelPackages` | `{ agencyId: 1, status: 1, createdAt: -1 }` | Compound | `name: 'idx_packages_agency_status_created'` | Agency catalog listing & status filtering |
+| `travelPackages` | `{ status: 1, publishedAt: -1, _id: -1 }` | Compound | `name: 'idx_packages_public_published'` | Public newest feed with zero in-memory sort |
+| `travelPackages` | `{ status: 1, packageCategory: 1, publishedAt: -1 }` | Compound | `name: 'idx_packages_public_category'` | Public category discovery rail |
+| `travelPackages` | `{ status: 1, basePrice: 1, publishedAt: -1 }` | Compound | `name: 'idx_packages_public_price'` | Price range discovery & filtering |
+| `travelPackages` | `{ status: 1, durationDays: 1, publishedAt: -1 }` | Compound | `name: 'idx_packages_public_duration'` | Duration filtering |
+| `travelPackages` | `{ destinationIds: 1, status: 1 }` | Multikey | `name: 'idx_packages_destinations'` | Destination-based package discovery |
 | `packageSchedules` | `{ packageId: 1, departureDate: 1 }` | Compound | None | Departure calendar availability lookup |
 | `packageBookings` | `{ bookingId: 1 }` | Unique | None | Booking manifest linkage |
 | `packageBookings` | `{ scheduleId: 1 }` | Single Field | None | Passenger manifest export for departure |
@@ -115,13 +123,24 @@ Every index in MongoDB incurs a RAM overhead in WiredTiger cache and a write lat
 
 | Collection | Index Keys | Type | Partial Filter / Options | Query Supported |
 |---|---|---|---|---|
-| `properties` | `{ location: "2dsphere" }` | Geospatial | `partialFilterExpression: { isVerified: true }` | Nearby homestay/resort proximity search |
-| `properties` | `{ slug: 1 }` | Unique | None | Property details routing (`/stays/:slug`) |
-| `properties` | `{ district: 1, propertyType: 1, isVerified: 1 }` | Compound | None | Accommodations directory filter rail |
+| `properties` | `{ slug: 1 }` | Unique | None | SEO property details lookup (`/properties/:slug`) |
+| `properties` | `{ location: "2dsphere" }` | Geospatial | None | Spherical radius search with `$geoNear` (`/properties/nearby`) |
+| `properties` | `{ businessProfileId: 1, status: 1, createdAt: -1 }` | Compound | None | Business dashboard property listing sorted newest-first |
+| `properties` | `{ accountId: 1, status: 1, createdAt: -1 }` | Compound | None | Direct account ownership validation and filtering |
+| `properties` | `{ status: 1, publishedAt: -1, _id: -1 }` | Compound | None | Public discovery catalog sorted newest-first (`IXSCAN` without in-memory `SORT`) |
+| `properties` | `{ status: 1, district: 1, publishedAt: -1 }` | Compound | None | Public catalog regional district filtering |
+| `properties` | `{ status: 1, propertyType: 1, publishedAt: -1 }` | Compound | None | Public catalog accommodation category filtering |
+| `properties` | `{ facilities: 1 }` | Multi-key | None | Fast array filtering for property amenities and facilities |
 | `propertyDocuments` | `{ propertyId: 1, docType: 1 }` | Compound | None | Property regulatory compliance check |
-| `rooms` | `{ propertyId: 1, isActive: 1 }` | Compound | None | Room selection matrix for property |
-| `roomRates` | `{ roomId: 1 }` | Unique | None | 1:1 hourly and daily pricing retrieval |
-| `roomInventory` | `{ roomId: 1, date: 1 }` | Unique Compound | None | Daily calendar occupancy grid |
+| `roomTypes` | `{ propertyId: 1, status: 1 }` | Compound (ESR) | None | Property room types directory & active public filtering |
+| `roomTypes` | `{ businessProfileId: 1, status: 1 }` | Compound (ESR) | None | Business host room management dashboard |
+| `roomTypes` | `{ propertyId: 1, slug: 1 }` | Unique Sparse | None | Enforces unique URL slug per property |
+| `roomInventory` | `{ roomTypeId: 1, date: 1 }` | Unique Compound | None | Exactly one calendar date capacity record per room type |
+| `roomInventory` | `{ propertyId: 1, date: 1 }` | Compound (ESR) | None | Property-wide multi-room availability scans |
+| `roomInventory` | `{ businessProfileId: 1, date: 1 }` | Compound (ESR) | None | Business host daily inventory control ledger |
+| `roomInventory` | `{ roomTypeId: 1, date: 1, availableUnits: 1 }` | Covered Compound | None | High-throughput covered index for live booking availability scans |
+| `rooms` | `{ propertyId: 1, isActive: 1 }` | Compound | None | Legacy room selection matrix for property |
+| `roomRates` | `{ roomId: 1 }` | Unique | None | Legacy 1:1 hourly and daily pricing retrieval |
 | `propertyFacilities`| `{ propertyId: 1, facilityCode: 1 }` | Compound | None | Amenity filter matching |
 | `propertyMenus` | `{ propertyId: 1, isAvailable: 1 }` | Compound | None | Dining menu preview |
 
@@ -131,13 +150,17 @@ Every index in MongoDB incurs a RAM overhead in WiredTiger cache and a write lat
 
 | Collection | Index Keys | Type | Partial Filter / Options | Query Supported |
 |---|---|---|---|---|
-| `bookings` | `{ bookingNumber: 1 }` | Unique | None | Customer booking lookup & invoice generation |
-| `bookings` | `{ touristId: 1, createdAt: -1 }` | Compound | None | Traveler "My Bookings" timeline |
-| `bookings` | `{ propertyId: 1, bookingStatus: 1, checkInTime: 1 }` | Compound | None | Host check-in dashboard register |
-| `bookings` | `{ roomId: 1, checkInTime: 1, checkOutTime: 1 }` | Compound | `partialFilterExpression: { bookingStatus: { $in: ["CONFIRMED", "CHECKED_IN"] } }` | Concurrency overlapping reservation detection |
-| `inventoryHolds` | `{ expiresAt: 1 }` | TTL Index | `expireAfterSeconds: 0` | Auto-release of abandoned checkout holds |
-| `inventoryHolds` | `{ idempotencyKey: 1 }` | Unique | None | Double-submit idempotency protection |
-| `inventoryHolds` | `{ roomId: 1, holdStartTime: 1, holdEndTime: 1 }` | Compound | None | Atomic overlap lock verification |
+| `bookings` | `{ bookingReference: 1 }` | Unique | None | Customer booking lookup & invoice generation |
+| `bookings` | `{ touristAccountId: 1, createdAt: -1 }` | Compound | None | Traveler "My Bookings" timeline |
+| `bookings` | `{ propertyId: 1, checkInDate: 1 }` | Compound | None | Host check-in dashboard register |
+| `bookings` | `{ businessProfileId: 1, createdAt: -1 }` | Compound | None | Merchant dashboard booking overview |
+| `bookings` | `{ holdId: 1 }` | Single Field | `sparse: true` | Direct hold-to-booking resolution |
+| `inventoryHolds` | `{ bookingId: 1 }` | Unique | None | 1:1 reservation to hold integrity |
+| `inventoryHolds` | `{ status: 1, expiresAt: 1 }` | Compound | None | Background expiry worker polling |
+| `inventoryHolds` | `{ touristAccountId: 1, status: 1 }` | Compound | None | Active holds by traveler |
+| `inventoryHolds` | `{ expiresAt: 1 }` | TTL Index | `expireAfterSeconds: 604800` | 7-day disk storage pruning |
+| `idempotencyKeys` | `{ touristAccountId: 1, key: 1 }` | Unique Compound | None | Scoped client request idempotency |
+| `idempotencyKeys` | `{ expiresAt: 1 }` | TTL Index | `expireAfterSeconds: 0` | 24-hour automatic request cache pruning |
 | `bookingGuests` | `{ bookingId: 1 }` | Single Field | None | Police guest manifest retrieval |
 | `bookingEvents` | `{ bookingId: 1, timestamp: 1 }` | Compound | None | Chronological audit trail of booking |
 | `cancellationRequests`| `{ bookingId: 1 }` | Unique | None | Cancellation appeal tracking |
@@ -168,7 +191,13 @@ Every index in MongoDB incurs a RAM overhead in WiredTiger cache and a write lat
 | `posts` | `{ authorId: 1, createdAt: -1, _id: -1 }` | Compound (ESR) | None | Moderation filtering by creator account ID |
 | `postComments` | `{ status: 1, createdAt: -1, _id: -1 }` | Compound (ESR) | None | Admin comment moderation listing |
 | `blocks` | `{ blockerAccountId: 1, blockedAccountId: 1 }` | Unique Compound | None | User blocking check |
-| `notifications` | `{ recipientAccountId: 1, isRead: 1, createdAt: -1 }` | Compound | None | Unread notification tray |
+| `notifications` | `{ recipientAccountId: 1, createdAt: -1, _id: -1 }` | Compound (ESR) | None | Paginated reverse-chronological notification tray |
+| `notifications` | `{ recipientAccountId: 1, isRead: 1, createdAt: -1 }` | Compound (ESR) | None | Unread badge counts and filtered tray query |
+| `notifications` | `{ relatedResourceType: 1, relatedResourceId: 1 }` | Sparse Compound | `sparse: true` | Resource reverse-lookup from deep link or target entity |
+| `notificationOutbox` | `{ idempotencyKey: 1 }` | Unique | None | Idempotent event deduplication invariant |
+| `notificationOutbox` | `{ status: 1, nextRetryAt: 1 }` | Compound | None | Background delivery worker polling queue index |
+| `notificationOutbox` | `{ createdAt: 1 }` | TTL Index | `expireAfterSeconds: 2592000` (30 days) | Auto-prune delivered and dead-letter outbox records |
+| `notificationPreferences` | `{ accountId: 1 }` | Unique | None | 1:1 account notification opt-out preference retrieval |
 | `media` | `{ storageKey: 1 }` | Unique | None | Cloud object key deduplication |
 | `media` | `{ destinationId: 1, displayOrder: 1 }` | Compound | None | Destination media gallery sorting |
 | `media` | `{ uploaderAccountId: 1, createdAt: -1 }` | Compound | None | Account media upload history |

@@ -27,12 +27,32 @@ import {
   REPORT_TARGET_TYPES,
   REPORT_REASONS,
   REPORT_STATUSES,
+  AGENCY_CATEGORIES,
+  AGENCY_DOCUMENT_TYPES,
+  PACKAGE_STATUSES,
+  PACKAGE_CATEGORIES,
+  PACKAGE_PRICING_UNITS,
+  PROPERTY_STATUSES,
+  PROPERTY_TYPES,
+  PROPERTY_FACILITIES,
+  INVENTORY_HOLD_STATUSES,
+  PAYMENT_PROVIDERS,
+  PAYMENT_STATUSES,
+  PAYMENT_WEBHOOK_STATUSES,
+  NOTIFICATION_TYPES,
+  DEVICE_PLATFORMS,
+  NOTIFICATION_PROVIDERS,
+  NOTIFICATION_DELIVERY_STATUSES,
 } from '@kerala-tourism/constants';
 
 // Role Types
 export type UserRole = (typeof USER_ROLES)[keyof typeof USER_ROLES];
 export type BookingMode = (typeof BOOKING_MODES)[keyof typeof BOOKING_MODES];
 export type BookingStatus = (typeof BOOKING_STATUSES)[keyof typeof BOOKING_STATUSES];
+export type InventoryHoldStatus = (typeof INVENTORY_HOLD_STATUSES)[keyof typeof INVENTORY_HOLD_STATUSES];
+export type PaymentProvider = (typeof PAYMENT_PROVIDERS)[keyof typeof PAYMENT_PROVIDERS];
+export type PaymentStatus = (typeof PAYMENT_STATUSES)[keyof typeof PAYMENT_STATUSES];
+export type PaymentWebhookStatus = (typeof PAYMENT_WEBHOOK_STATUSES)[keyof typeof PAYMENT_WEBHOOK_STATUSES];
 export type DestinationStatus = (typeof DESTINATION_STATUSES)[keyof typeof DESTINATION_STATUSES];
 export type KeralaDistrict = (typeof KERALA_DISTRICTS)[number];
 export type DestinationVerificationStatus = (typeof DESTINATION_VERIFICATION_STATUSES)[keyof typeof DESTINATION_VERIFICATION_STATUSES];
@@ -58,6 +78,14 @@ export type AdminAuditAction = (typeof ADMIN_AUDIT_ACTIONS)[keyof typeof ADMIN_A
 export type AuditTargetEntityType = (typeof AUDIT_TARGET_ENTITY_TYPES)[keyof typeof AUDIT_TARGET_ENTITY_TYPES];
 export type ModerationContentType = (typeof MODERATION_CONTENT_TYPES)[keyof typeof MODERATION_CONTENT_TYPES];
 export type ReportTargetType = (typeof REPORT_TARGET_TYPES)[keyof typeof REPORT_TARGET_TYPES];
+export type AgencyCategory = (typeof AGENCY_CATEGORIES)[keyof typeof AGENCY_CATEGORIES];
+export type AgencyDocumentType = (typeof AGENCY_DOCUMENT_TYPES)[keyof typeof AGENCY_DOCUMENT_TYPES];
+export type PackageStatus = (typeof PACKAGE_STATUSES)[keyof typeof PACKAGE_STATUSES];
+export type PackageCategory = (typeof PACKAGE_CATEGORIES)[keyof typeof PACKAGE_CATEGORIES];
+export type PackagePricingUnit = (typeof PACKAGE_PRICING_UNITS)[keyof typeof PACKAGE_PRICING_UNITS];
+export type PropertyStatus = (typeof PROPERTY_STATUSES)[keyof typeof PROPERTY_STATUSES];
+export type PropertyType = (typeof PROPERTY_TYPES)[keyof typeof PROPERTY_TYPES];
+export type PropertyFacility = (typeof PROPERTY_FACILITIES)[keyof typeof PROPERTY_FACILITIES];
 export type ReportReason = (typeof REPORT_REASONS)[keyof typeof REPORT_REASONS];
 export type ReportStatus = (typeof REPORT_STATUSES)[keyof typeof REPORT_STATUSES];
 
@@ -618,7 +646,7 @@ export interface AuditLogEntryDto {
   id: string;
   actorAccountId: string;
   actorAccountType: AccountType;
-  actorAdminLevel: AdminLevel;
+  actorAdminLevel?: AdminLevel | null;
   action: AdminAuditAction;
   targetEntityId: string;
   targetEntityType: AuditTargetEntityType;
@@ -790,3 +818,637 @@ export interface ReportReviewResponseDto {
   report: ContentReportDto;
   auditLog: AuditLogEntryDto;
 }
+
+// ==============================================================================
+// Day 19 – Agency Registration, Document Management & Verification DTOs
+// ==============================================================================
+
+export interface AgencyDocumentDto {
+  id: string;
+  documentType: AgencyDocumentType;
+  originalFileName: string;
+  fileSize: number;
+  mimeType: string;
+  uploadedAt: string;
+}
+
+export interface AgencyDto {
+  id: string;
+  accountId: string;
+  businessProfileId: string;
+  agencyName: string;
+  registrationNumber: string;
+  businessCategory: AgencyCategory;
+  description: string;
+  contactEmail: string;
+  contactPhone: string;
+  website: string | null;
+  address: string;
+  district: KeralaDistrict;
+  state: string;
+  pinCode: string;
+  logoMediaId: string | null;
+  verificationStatus: VerificationStatus;
+  reviewedBy: string | null;
+  reviewedAt: string | null;
+  verifiedAt: string | null;
+  rejectionReason: string | null;
+  documents?: AgencyDocumentDto[];
+  documentsCount?: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AgencyListResponseDto {
+  items: AgencyDto[];
+  pagination: AdminUsersPaginationMeta;
+}
+
+export interface AgencyReviewResponseDto {
+  agency: AgencyDto;
+  auditLog: AuditLogEntryDto;
+}
+
+// ==============================================================================
+// Day 20 – Travel Package Types & DTOs
+// ==============================================================================
+
+export interface ItineraryDayDto {
+  dayNumber: number;
+  title: string;
+  description: string;
+  activities: string[];
+  destinationId?: string | null;
+  estimatedDuration?: string | null;
+}
+
+export interface PackageGroupPricingTierDto {
+  minPax: number;
+  maxPax: number;
+  pricePerPerson: number;
+}
+
+export interface TravelPackageDto {
+  id: string;
+  agencyId: string;
+  createdBy: string;
+  updatedBy: string;
+  title: string;
+  slug: string;
+  shortDescription: string;
+  description: string;
+  packageCategory: PackageCategory;
+  tags: string[];
+  destinationIds: string[];
+  startLocation?: string | null;
+  endLocation?: string | null;
+  itinerary: ItineraryDayDto[];
+  durationDays: number;
+  durationNights: number;
+  inclusions: string[];
+  exclusions: string[];
+  importantInformation?: string | null;
+  cancellationPolicy?: string | null;
+  currency: string;
+  basePrice: number;
+  childPrice?: number | null;
+  groupPricing?: PackageGroupPricingTierDto[];
+  pricingUnit: PackagePricingUnit;
+  maxGroupSize?: number | null;
+  coverMediaId?: string | null;
+  galleryMediaIds: string[];
+  status: PackageStatus;
+  submittedAt?: string | null;
+  publishedAt?: string | null;
+  reviewedAt?: string | null;
+  reviewedBy?: string | null;
+  rejectionReason?: string | null;
+  archivedAt?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface PublicPackageAgencyDto {
+  id: string;
+  agencyName: string;
+  district: KeralaDistrict;
+  contactEmail: string;
+  contactPhone: string;
+  website?: string | null;
+  logoMediaId?: string | null;
+}
+
+export interface PublicTravelPackageDto {
+  id: string;
+  title: string;
+  slug: string;
+  shortDescription: string;
+  description: string;
+  packageCategory: PackageCategory;
+  tags: string[];
+  destinations: Array<{
+    id: string;
+    name: string;
+    slug: string;
+    district: KeralaDistrict;
+    coverImage?: string | null;
+  }>;
+  startLocation?: string | null;
+  endLocation?: string | null;
+  itinerary: ItineraryDayDto[];
+  durationDays: number;
+  durationNights: number;
+  inclusions: string[];
+  exclusions: string[];
+  importantInformation?: string | null;
+  cancellationPolicy?: string | null;
+  currency: string;
+  basePrice: number;
+  childPrice?: number | null;
+  groupPricing?: PackageGroupPricingTierDto[];
+  pricingUnit: PackagePricingUnit;
+  maxGroupSize?: number | null;
+  coverMediaId?: string | null;
+  galleryMediaIds: string[];
+  publishedAt: string;
+  agency: PublicPackageAgencyDto;
+}
+
+export interface PackageListResponseDto {
+  items: TravelPackageDto[];
+  pagination: AdminUsersPaginationMeta;
+}
+
+export interface PublicPackageListResponseDto {
+  items: PublicTravelPackageDto[];
+  pagination: AdminUsersPaginationMeta;
+}
+
+export interface AdminPackageReviewDto {
+  package: TravelPackageDto;
+  auditLog: AuditLogEntryDto;
+}
+
+export interface GeoPoint {
+  type: 'Point';
+  coordinates: [number, number]; // [longitude, latitude]
+}
+
+export interface PropertyDto {
+  id: string;
+  businessProfileId: string;
+  accountId: string;
+  createdBy: string;
+  updatedBy: string;
+  name: string;
+  slug: string;
+  propertyType: PropertyType;
+  shortDescription?: string | null;
+  description?: string | null;
+  address: string;
+  district: KeralaDistrict;
+  city?: string | null;
+  state: string;
+  postalCode?: string | null;
+  location: GeoPoint;
+  contactPhone?: string | null;
+  contactEmail?: string | null;
+  website?: string | null;
+  facilities: string[];
+  coverMediaId?: string | null;
+  galleryMediaIds: string[];
+  status: PropertyStatus;
+  submittedAt?: string | null;
+  publishedAt?: string | null;
+  reviewedAt?: string | null;
+  reviewedBy?: string | null;
+  rejectionReason?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface PublicPropertyBusinessDto {
+  id: string;
+  businessName: string;
+  businessType: BusinessType;
+  district?: string | null;
+  contactNumber?: string | null;
+}
+
+export interface PublicPropertyDto {
+  id: string;
+  name: string;
+  slug: string;
+  propertyType: PropertyType;
+  shortDescription?: string | null;
+  description?: string | null;
+  address: string;
+  district: KeralaDistrict;
+  city?: string | null;
+  state: string;
+  postalCode?: string | null;
+  location: GeoPoint;
+  contactPhone?: string | null;
+  contactEmail?: string | null;
+  website?: string | null;
+  facilities: string[];
+  coverMediaId?: string | null;
+  galleryMediaIds: string[];
+  coverImageUrl?: string | null;
+  galleryImageUrls?: string[];
+  distanceMeters?: number | null;
+  distanceKm?: number | null;
+  publishedAt: string;
+  business: PublicPropertyBusinessDto;
+}
+
+export interface PropertyListResponseDto {
+  items: PropertyDto[];
+  pagination: AdminUsersPaginationMeta;
+}
+
+export interface PublicPropertyListResponseDto {
+  items: PublicPropertyDto[];
+  pagination: AdminUsersPaginationMeta;
+}
+
+export interface AdminPropertyReviewDto {
+  property: PropertyDto;
+  auditLog: AuditLogEntryDto;
+}
+
+// ============================================================================
+// ROOM & INVENTORY DOMAIN TYPES (Day 22)
+// ============================================================================
+
+export type RoomStatus = 'ACTIVE' | 'INACTIVE' | 'ARCHIVED';
+
+export type RoomCategory =
+  | 'STANDARD'
+  | 'DELUXE'
+  | 'PREMIUM'
+  | 'SUITE'
+  | 'VILLA'
+  | 'STUDIO'
+  | 'DORMITORY'
+  | 'COTTAGE'
+  | 'OTHER';
+
+export type RoomFacility =
+  | 'WIFI'
+  | 'AIR_CONDITIONING'
+  | 'TV'
+  | 'PRIVATE_BATHROOM'
+  | 'BALCONY'
+  | 'SEA_VIEW'
+  | 'MOUNTAIN_VIEW'
+  | 'KITCHEN'
+  | 'MINIBAR'
+  | 'DESK'
+  | 'ROOM_SERVICE'
+  | 'COFFEE_MAKER'
+  | 'SAFE'
+  | 'HAIRDRYER'
+  | 'IRONING';
+
+export type RoomPricingUnit = 'PER_NIGHT' | 'PER_DAY';
+
+export type RoomSizeUnit = 'SQ_FT' | 'SQ_M';
+
+export type RoomInventoryBlockType = 'MAINTENANCE' | 'BLOCKED';
+
+export interface RoomTypeDto {
+  id: string;
+  propertyId: string;
+  businessProfileId: string;
+  accountId: string;
+  name: string;
+  slug: string;
+  description?: string | null;
+  roomCategory: RoomCategory;
+  maxAdults: number;
+  maxChildren: number;
+  maxOccupancy: number;
+  bedConfiguration: string;
+  bedCount: number;
+  roomSize?: number | null;
+  roomSizeUnit: RoomSizeUnit;
+  facilities: string[];
+  basePrice: number; // In integer paise
+  basePriceInr: number; // In INR (e.g. 3500.00)
+  currency: string; // 'INR'
+  pricingUnit: RoomPricingUnit;
+  coverMediaId?: string | null;
+  galleryMediaIds: string[];
+  coverImageUrl?: string | null;
+  galleryImageUrls?: string[];
+  status: RoomStatus;
+  totalUnits: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface PublicRoomTypeDto {
+  id: string;
+  propertyId: string;
+  name: string;
+  slug: string;
+  description?: string | null;
+  roomCategory: RoomCategory;
+  maxAdults: number;
+  maxChildren: number;
+  maxOccupancy: number;
+  bedConfiguration: string;
+  bedCount: number;
+  roomSize?: number | null;
+  roomSizeUnit: RoomSizeUnit;
+  facilities: string[];
+  basePrice: number;
+  pricePerNight: number; // In INR
+  pricePerNightPaise: number;
+  currency: string;
+  pricingUnit: RoomPricingUnit;
+  coverMediaId?: string | null;
+  galleryMediaIds?: string[];
+  coverImageUrl?: string | null;
+  galleryImageUrls: string[];
+  totalUnits: number;
+}
+
+export interface RoomInventoryDto {
+  id: string;
+  propertyId: string;
+  roomTypeId: string;
+  businessProfileId: string;
+  date: string; // ISO 'YYYY-MM-DD'
+  totalUnits: number;
+  availableUnits: number;
+  blockedUnits: number;
+  maintenanceUnits: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface RoomAvailabilityCheckResultDto {
+  roomType: PublicRoomTypeDto;
+  requestedRooms: number;
+  availableUnitsAcrossStay: number;
+  isAvailable: boolean;
+  nightsCount: number;
+  pricePerNight: number;
+  totalStayPrice: number;
+  currency: string;
+}
+
+export interface RoomTypeListResponseDto {
+  items: RoomTypeDto[];
+  total: number;
+  pagination?: AdminUsersPaginationMeta;
+}
+
+export interface PublicRoomTypeListResponseDto {
+  items: PublicRoomTypeDto[];
+  total: number;
+  pagination?: AdminUsersPaginationMeta;
+}
+
+export interface RoomInventoryListResponseDto {
+  items: RoomInventoryDto[];
+  total: number;
+  startDate: string;
+  endDate: string;
+  dateRange?: { startDate: string; endDate: string };
+  roomTypeId?: string;
+}
+
+export interface PropertyAvailabilityResponseDto {
+  propertyId: string;
+  propertyName: string;
+  checkIn: string;
+  checkOut: string;
+  nightsCount: number;
+  availableRoomTypes: RoomAvailabilityCheckResultDto[];
+}
+
+// Day 23 Booking Engine & Inventory Hold DTOs
+export interface PriceSnapshotDailyBreakdownDto {
+  date: string; // ISO 'YYYY-MM-DD'
+  pricePaise: number;
+  priceInr: number;
+}
+
+export interface PriceSnapshotDto {
+  basePricePaise: number;
+  basePriceInr: number;
+  numberOfRooms: number;
+  numberOfNights: number;
+  dailyBreakdown: PriceSnapshotDailyBreakdownDto[];
+  subtotalPaise: number;
+  subtotalInr: number;
+  taxesPaise: number;
+  taxesInr: number;
+  totalPaise: number;
+  totalInr: number;
+  currency: string;
+}
+
+export interface GuestDetailsDto {
+  primaryGuestName: string;
+  email: string;
+  phone: string;
+  specialRequests?: string | null;
+}
+
+export interface BookingDto {
+  id: string;
+  bookingReference: string;
+  touristAccountId: string;
+  propertyId: string;
+  roomTypeId: string;
+  businessProfileId: string;
+  checkInDate: string; // ISO 'YYYY-MM-DD'
+  checkOutDate: string; // ISO 'YYYY-MM-DD'
+  numberOfRooms: number;
+  adults: number;
+  children: number;
+  nights: number;
+  status: BookingStatus;
+  holdId?: string | null;
+  paidAt?: string | null;
+  confirmedAt?: string | null;
+  paymentId?: string | null;
+  paymentReference?: string | null;
+  priceSnapshot: PriceSnapshotDto;
+  guestDetails: GuestDetailsDto;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface InventoryHoldDto {
+  id: string;
+  bookingId: string;
+  roomTypeId: string;
+  propertyId: string;
+  businessProfileId: string;
+  touristAccountId: string;
+  numberOfRooms: number;
+  stayDates: string[]; // ['YYYY-MM-DD', ...]
+  status: InventoryHoldStatus;
+  expiresAt: string; // ISO String
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CreateBookingHoldResponseDto {
+  booking: BookingDto;
+  hold: InventoryHoldDto;
+  expiresAt: string; // ISO String
+  remainingSeconds: number;
+}
+
+export interface HoldExpiryResultDto {
+  scannedCount: number;
+  expiredCount: number;
+  restoredCount: number;
+  failedCount: number;
+}
+
+export interface PaymentDto {
+  id: string;
+  paymentReference: string;
+  bookingId: string;
+  holdId: string;
+  touristAccountId: string;
+  businessProfileId: string;
+  provider: PaymentProvider;
+  providerOrderId?: string | null;
+  providerPaymentId?: string | null;
+  amountPaise: number;
+  amountInr: number;
+  currency: string;
+  status: PaymentStatus;
+  failureCode?: string | null;
+  failureDescription?: string | null;
+  reconciliationStatus?: string | null;
+  paidAt?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface RazorpayCheckoutDataDto {
+  keyId: string;
+  orderId: string;
+  amountPaise: number;
+  currency: string;
+  businessName: string;
+  description: string;
+  prefill: {
+    name: string;
+    email: string;
+    contact: string;
+  };
+  notes: Record<string, string>;
+}
+
+export interface CreatePaymentResponseDto {
+  payment: PaymentDto;
+  checkoutData: RazorpayCheckoutDataDto;
+}
+
+export interface VerifyPaymentResponseDto {
+  payment: PaymentDto;
+  booking: BookingDto;
+  isConfirmed: boolean;
+  message: string;
+}
+
+export interface PaymentWebhookResultDto {
+  received: boolean;
+  event: string;
+  eventId: string;
+  status: string;
+}
+
+// ============================================================================
+// NOTIFICATION & DEVICE TYPES (DAY 26)
+// ============================================================================
+
+export type NotificationType = (typeof NOTIFICATION_TYPES)[keyof typeof NOTIFICATION_TYPES];
+export type DevicePlatform = (typeof DEVICE_PLATFORMS)[keyof typeof DEVICE_PLATFORMS];
+export type NotificationProvider = (typeof NOTIFICATION_PROVIDERS)[keyof typeof NOTIFICATION_PROVIDERS];
+export type NotificationDeliveryStatus = (typeof NOTIFICATION_DELIVERY_STATUSES)[keyof typeof NOTIFICATION_DELIVERY_STATUSES];
+
+export interface NotificationDto {
+  id: string;
+  recipientAccountId: string;
+  notificationType: NotificationType;
+  title: string;
+  body: string;
+  dataPayload?: Record<string, string>;
+  relatedResourceType?: 'BOOKING' | 'PAYMENT' | 'POST' | 'ACCOUNT';
+  relatedResourceId?: string;
+  isRead: boolean;
+  readAt?: string | null;
+  deliveryStatus: NotificationDeliveryStatus;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface NotificationListResponseDto {
+  items: NotificationDto[];
+  pagination: AdminUsersPaginationMeta;
+}
+
+export interface NotificationUnreadCountDto {
+  unreadCount: number;
+}
+
+export interface DeviceDto {
+  id: string;
+  platform: DevicePlatform;
+  maskedToken: string;
+  deviceId?: string;
+  isActive: boolean;
+  lastSeenAt: string;
+  createdAt: string;
+}
+
+export interface DeviceListResponseDto {
+  items: DeviceDto[];
+}
+
+export interface RegisterDeviceResponseDto {
+  device: DeviceDto;
+  message: string;
+}
+
+export interface NotificationPreferencesDto {
+  bookingUpdates: boolean;
+  paymentUpdates: boolean;
+  socialUpdates: boolean;
+}
+
+export interface UpdateNotificationPreferencesDto {
+  bookingUpdates?: boolean;
+  paymentUpdates?: boolean;
+  socialUpdates?: boolean;
+}
+
+export interface SendPushNotificationParams {
+  deviceTokens: string[];
+  title: string;
+  body: string;
+  data?: Record<string, string>;
+}
+
+export interface PushDeliveryResult {
+  success: boolean;
+  deliveredCount: number;
+  failedCount: number;
+  invalidTokens: string[];
+  error?: string;
+}
+
+
+
+

@@ -45,8 +45,10 @@ export class DestinationsRepository {
       DestinationModel.find(filter)
         .sort({ [sortField]: sortDirection })
         .skip((query.page - 1) * query.limit)
-        .limit(query.limit),
-      DestinationModel.countDocuments(filter),
+        .limit(query.limit)
+        .lean<IDestinationDocument[]>()
+        .exec(),
+      DestinationModel.countDocuments(filter).exec(),
     ]);
 
     return { items, total };
@@ -143,14 +145,19 @@ export class DestinationsRepository {
     const objectIds = ids.map((id) =>
       id instanceof Types.ObjectId ? id : new Types.ObjectId(id.toString()),
     );
-    return DestinationModel.find({ _id: { $in: objectIds } });
+    return DestinationModel.find({ _id: { $in: objectIds } })
+      .select('name slug district locality images')
+      .lean<IDestinationDocument[]>()
+      .exec();
   }
 
   /**
    * Find any destination by slug
    */
   public async findDestinationBySlug(slug: string): Promise<IDestinationDocument | null> {
-    return DestinationModel.findOne({ slug: slug.toLowerCase().trim() });
+    return DestinationModel.findOne({ slug: slug.toLowerCase().trim() })
+      .lean<IDestinationDocument>()
+      .exec();
   }
 
   /**
@@ -206,7 +213,10 @@ export class DestinationsRepository {
    * List all active categories in alphabetical order
    */
   public async listActiveCategories(): Promise<IDestinationCategoryDocument[]> {
-    return DestinationCategoryModel.find({ isActive: true }).sort({ name: 1 });
+    return DestinationCategoryModel.find({ isActive: true })
+      .sort({ name: 1 })
+      .lean<IDestinationCategoryDocument[]>()
+      .exec();
   }
 
   /**
@@ -224,7 +234,7 @@ export class DestinationsRepository {
   public async findSubmissionById(
     id: string | Types.ObjectId,
   ): Promise<IDestinationSubmissionDocument | null> {
-    return DestinationSubmissionModel.findById(id);
+    return DestinationSubmissionModel.findById(id).lean<IDestinationSubmissionDocument>().exec();
   }
 
   /**
@@ -240,8 +250,10 @@ export class DestinationsRepository {
       DestinationSubmissionModel.find(filter)
         .sort({ createdAt: -1 })
         .skip((page - 1) * limit)
-        .limit(limit),
-      DestinationSubmissionModel.countDocuments(filter),
+        .limit(limit)
+        .lean<IDestinationSubmissionDocument[]>()
+        .exec(),
+      DestinationSubmissionModel.countDocuments(filter).exec(),
     ]);
     return { items, total };
   }

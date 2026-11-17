@@ -7,7 +7,7 @@ export class MediaRepository {
   }
 
   public async findById(id: string | Types.ObjectId): Promise<IMediaDocument | null> {
-    return MediaModel.findById(id);
+    return MediaModel.findById(id).lean<IMediaDocument>().exec();
   }
 
   public async findByIds(ids: (string | Types.ObjectId)[]): Promise<IMediaDocument[]> {
@@ -17,21 +17,27 @@ export class MediaRepository {
     const objectIds = ids.map((id) =>
       id instanceof Types.ObjectId ? id : new Types.ObjectId(id.toString()),
     );
-    return MediaModel.find({ _id: { $in: objectIds } });
+    return MediaModel.find({ _id: { $in: objectIds } })
+      .select('url mimeType fileSizeBytes destinationId storageKey status')
+      .lean<IMediaDocument[]>()
+      .exec();
   }
 
   public async findByStorageKey(storageKey: string): Promise<IMediaDocument | null> {
-    return MediaModel.findOne({ storageKey });
+    return MediaModel.findOne({ storageKey }).lean<IMediaDocument>().exec();
   }
 
   public async findByDestination(
     destinationId: string | Types.ObjectId,
   ): Promise<IMediaDocument[]> {
-    return MediaModel.find({ destinationId: new Types.ObjectId(destinationId.toString()) }).sort({
-      isPrimary: -1,
-      displayOrder: 1,
-      createdAt: 1,
-    });
+    return MediaModel.find({ destinationId: new Types.ObjectId(destinationId.toString()) })
+      .sort({
+        isPrimary: -1,
+        displayOrder: 1,
+        createdAt: 1,
+      })
+      .lean<IMediaDocument[]>()
+      .exec();
   }
 
   public async findPrimaryForDestination(
@@ -40,7 +46,9 @@ export class MediaRepository {
     return MediaModel.findOne({
       destinationId: new Types.ObjectId(destinationId.toString()),
       isPrimary: true,
-    });
+    })
+      .lean<IMediaDocument>()
+      .exec();
   }
 
   public async unsetPrimaryForDestination(

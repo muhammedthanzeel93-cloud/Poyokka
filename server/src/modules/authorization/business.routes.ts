@@ -1,16 +1,13 @@
 import { Router } from 'express';
 import { authenticate } from '../../middlewares/auth.middleware';
-import {
-  requireAccountType,
-  requireVerifiedBusiness,
-} from '../../middlewares/authorization.middleware';
+import { requireAccountType } from '../../middlewares/authorization.middleware';
 import { validateBody } from '../../middlewares/validateRequest';
-import {
-  updateBusinessProfileSchema,
-  createPropertySchema,
-  createTourPackageSchema,
-} from '@kerala-tourism/validation';
+import { updateBusinessProfileSchema } from '@kerala-tourism/validation';
 import { authorizationController } from './authorization.controller';
+import { businessAgencyRoutes } from '../agencies/agency.routes';
+import { businessPackageRoutes } from '../packages';
+import { businessPropertyRoutes } from '../properties';
+import { businessPropertyRoomRoutes, businessRoomRoutes } from '../rooms';
 import { ACCOUNT_TYPES } from '@kerala-tourism/constants';
 
 const router = Router();
@@ -40,43 +37,15 @@ router.get(
   authorizationController.getBusinessDashboard,
 );
 
-// Property Creation: Restricted to VERIFIED Businesses
-router.post(
-  '/properties',
-  authenticate,
-  requireAccountType(ACCOUNT_TYPES.BUSINESS),
-  requireVerifiedBusiness,
-  validateBody(createPropertySchema),
-  authorizationController.createProperty,
-);
+// Accommodation Properties Management (Day 21)
+router.use('/properties/:propertyId/rooms', businessPropertyRoomRoutes);
+router.use('/properties', businessPropertyRoutes);
 
-// Package Creation: Restricted to VERIFIED Businesses
-router.post(
-  '/packages',
-  authenticate,
-  requireAccountType(ACCOUNT_TYPES.BUSINESS),
-  requireVerifiedBusiness,
-  validateBody(createTourPackageSchema),
-  authorizationController.createPackage,
-);
+// Room & Inventory Management (Day 22)
+router.use('/rooms', businessRoomRoutes);
 
-// Property Update: Verified Business + Direct Ownership
-router.patch(
-  '/properties/:propertyId',
-  authenticate,
-  requireAccountType(ACCOUNT_TYPES.BUSINESS),
-  requireVerifiedBusiness,
-  authorizationController.updateProperty,
-);
-
-// Package Update: Verified Business + Direct Ownership
-router.patch(
-  '/packages/:packageId',
-  authenticate,
-  requireAccountType(ACCOUNT_TYPES.BUSINESS),
-  requireVerifiedBusiness,
-  authorizationController.updatePackage,
-);
+// Travel Packages Management (Day 20)
+router.use('/packages', businessPackageRoutes);
 
 // Booking Inspection: Business Ownership
 router.get(
@@ -85,5 +54,8 @@ router.get(
   requireAccountType(ACCOUNT_TYPES.BUSINESS),
   authorizationController.getBusinessBooking,
 );
+
+// Travel Agency Profile Management (Day 19)
+router.use('/agency', businessAgencyRoutes);
 
 export default router;

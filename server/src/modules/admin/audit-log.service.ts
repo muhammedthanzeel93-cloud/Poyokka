@@ -78,7 +78,7 @@ export const sanitizeAuditStateSnapshot = (
 export interface RecordAdminAuditInput {
   actorAccountId: Types.ObjectId | string;
   actorAccountType: AccountType;
-  actorAdminLevel: AdminLevel;
+  actorAdminLevel?: AdminLevel | null;
   action: AdminAuditAction;
   targetEntityId: Types.ObjectId | string;
   targetEntityType?: AuditTargetEntityType;
@@ -104,7 +104,7 @@ export class AuditLogService {
     const doc = new AuditLogModel({
       actorAccountId: new Types.ObjectId(input.actorAccountId),
       actorAccountType: input.actorAccountType,
-      actorAdminLevel: input.actorAdminLevel,
+      actorAdminLevel: input.actorAdminLevel ?? null,
       action: input.action,
       targetEntityId: new Types.ObjectId(input.targetEntityId),
       targetEntityType: input.targetEntityType ?? 'ACCOUNT',

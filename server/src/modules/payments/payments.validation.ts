@@ -1,8 +1,27 @@
-import { z } from 'zod';
+import crypto from 'crypto';
+export {
+  bookingIdParamSchema,
+  verifyPaymentSignatureSchema,
+  paymentIdParamSchema,
+  paymentQueryFilterSchema,
+} from '@kerala-tourism/validation';
 
-export const createPaymentSchema = z.object({
-  bookingId: z.string().min(1),
-  amount: z.number().positive(),
-  currency: z.string().length(3).default('INR'),
-  paymentMethod: z.enum(['UPI', 'CARD', 'NETBANKING', 'PAY_AT_PROPERTY']),
-});
+export type {
+  BookingIdParamInput,
+  VerifyPaymentSignatureInput,
+  PaymentIdParamInput,
+  PaymentQueryFilterInput,
+} from '@kerala-tourism/validation';
+
+/**
+ * Generates an uppercase, cryptographically random, collision-resistant payment reference
+ * Format: PAY-YYYYMMDD-<6 hex chars>
+ */
+export const generatePaymentReference = (): string => {
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = String(now.getMonth() + 1).padStart(2, '0');
+  const day = String(now.getDate()).padStart(2, '0');
+  const randomSuffix = crypto.randomBytes(3).toString('hex').toUpperCase();
+  return `PAY-${year}${month}${day}-${randomSuffix}`;
+};

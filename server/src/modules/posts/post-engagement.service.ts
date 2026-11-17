@@ -1,5 +1,5 @@
 import { ClientSession, Types } from 'mongoose';
-import { POST_ENGAGEMENT_RULES } from '@kerala-tourism/constants';
+import { NOTIFICATION_TYPES, POST_ENGAGEMENT_RULES } from '@kerala-tourism/constants';
 import {
   AuthenticatedPrincipal,
   PostAuthorDto,
@@ -15,6 +15,7 @@ import {
   ITouristProfileDocument,
 } from '../../shared/models';
 import { AuthRepository, authRepository } from '../auth/auth.repository';
+import { NotificationService, notificationService } from '../notifications/notification.service';
 import { PostsRepository, postsRepository } from './post.repository';
 import { verifyActiveTouristAccount } from './post.service';
 import {
@@ -35,6 +36,7 @@ export class PostEngagementService {
     private repo: PostEngagementRepository = postEngagementRepository,
     private postsRepo: PostsRepository = postsRepository,
     private authRepo: AuthRepository = authRepository,
+    private notifService: NotificationService = notificationService,
   ) {}
 
   public setRepository(repository: PostEngagementRepository): void {
@@ -109,8 +111,11 @@ export class PostEngagementService {
   ): Promise<PostLikeResponseDto> {
     await verifyActiveTouristAccount(principal, this.authRepo);
 
-    return this.repo.withTransaction(async (session) => {
+    let authorAccountId: string | null = null;
+
+    const result = await this.repo.withTransaction(async (session) => {
       const post = await this.requireEligiblePublicPost(postId, session);
+      authorAccountId = post.authorId.toString();
 
       const existing = await this.repo.findPostLike(principal.id, post._id, session);
       if (existing) {
@@ -143,6 +148,22 @@ export class PostEngagementService {
         },
       };
     });
+
+    if (authorAccountId && authorAccountId !== principal.id) {
+      await this.notifService.publishEvent({
+        callerAccountId: principal.id,
+        recipientAccountId: authorAccountId,
+        notificationType: NOTIFICATION_TYPES.SOCIAL_LIKE,
+        title: 'New Like',
+        body: 'Someone liked your post.',
+        dataPayload: { route: 'post_details', postId },
+        relatedResourceType: 'POST',
+        relatedResourceId: postId,
+        idempotencyKey: `evt_post_like_${principal.id}_${postId}`,
+      }).catch((err) => console.error('[Notification Publish Error]:', err));
+    }
+
+    return result;
   }
 
   /**
@@ -183,8 +204,11 @@ export class PostEngagementService {
   ): Promise<CreateCommentResult> {
     await verifyActiveTouristAccount(principal, this.authRepo);
 
+    let authorAccountId: string | null = null;
+
     const { created, commentsCount } = await this.repo.withTransaction(async (session) => {
       const post = await this.requireEligiblePublicPost(postId, session);
+      authorAccountId = post.authorId.toString();
 
       const commentDoc = await this.repo.createComment(
         {
@@ -212,6 +236,23 @@ export class PostEngagementService {
 
       return { created: commentDoc, commentsCount: updatedCount };
     });
+
+    if (authorAccountId && authorAccountId !== principal.id) {
+      const snippet =
+        input.content.length > 50 ? `${input.content.substring(0, 47)}...` : input.content;
+
+      await this.notifService.publishEvent({
+        callerAccountId: principal.id,
+        recipientAccountId: authorAccountId,
+        notificationType: NOTIFICATION_TYPES.SOCIAL_COMMENT,
+        title: 'New Comment',
+        body: `Someone commented: "${snippet}"`,
+        dataPayload: { route: 'post_details', postId },
+        relatedResourceType: 'POST',
+        relatedResourceId: postId,
+        idempotencyKey: `evt_post_comment_${created._id.toString()}`,
+      }).catch((err) => console.error('[Notification Publish Error]:', err));
+    }
 
     const [hydrated] = await this.hydrateComments([created]);
     return { comment: hydrated, commentsCount };

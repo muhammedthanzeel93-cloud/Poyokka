@@ -21,6 +21,9 @@ import {
 } from '@kerala-tourism/validation';
 import { adminController } from '../admin';
 import { adminModerationRoutes } from '../moderation';
+import { adminAgencyRoutes } from '../agencies/agency.routes';
+import { adminPackageRoutes } from '../packages';
+import { adminPropertyRoutes } from '../properties';
 import { authorizationController } from './authorization.controller';
 import { destinationsController } from '../destinations/destinations.controller';
 import { ACCOUNT_TYPES, ADMIN_PERMISSIONS } from '@kerala-tourism/constants';
@@ -156,5 +159,14 @@ router.patch(
 
 // Admin Content Moderation System (Day 18)
 router.use('/moderation', adminModerationRoutes);
+
+// Admin Travel Agency Verification & Management (Day 19)
+router.use('/agencies', adminAgencyRoutes);
+
+// Admin Travel Package Moderation & Management (Day 20)
+router.use('/packages', adminPackageRoutes);
+
+// Admin Accommodation Property Moderation & Management (Day 21)
+router.use('/properties', adminPropertyRoutes);
 
 export default router;

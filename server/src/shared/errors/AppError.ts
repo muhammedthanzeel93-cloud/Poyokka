@@ -27,6 +27,18 @@ export class ValidationError extends AppError {
   }
 }
 
+export class BadRequestError extends AppError {
+  constructor(
+    message = 'Bad request',
+    codeOrDetails: string | unknown = 'BAD_REQUEST',
+    details?: unknown,
+  ) {
+    const code = typeof codeOrDetails === 'string' ? codeOrDetails : 'BAD_REQUEST';
+    const finalDetails = typeof codeOrDetails === 'string' ? details : codeOrDetails;
+    super(message, 400, code, finalDetails, true);
+  }
+}
+
 export class UnauthorizedError extends AppError {
   constructor(
     message = 'Authentication required',
@@ -64,8 +76,14 @@ export class NotFoundError extends AppError {
 }
 
 export class ConflictError extends AppError {
-  constructor(message = 'Resource conflict', details?: unknown) {
-    super(message, 409, 'CONFLICT', details, true);
+  constructor(
+    message = 'Resource conflict',
+    codeOrDetails: string | unknown = 'CONFLICT',
+    details?: unknown,
+  ) {
+    const code = typeof codeOrDetails === 'string' ? codeOrDetails : 'CONFLICT';
+    const finalDetails = typeof codeOrDetails === 'string' ? details : codeOrDetails;
+    super(message, 409, code, finalDetails, true);
   }
 }
 

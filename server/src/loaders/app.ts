@@ -3,6 +3,7 @@ import cors from 'cors';
 import helmet from 'helmet';
 import cookieParser from 'cookie-parser';
 import routes from '../routes';
+import { correlationIdMiddleware } from '../middlewares/correlationId';
 import { requestLogger } from '../middlewares/requestLogger';
 import { rateLimiter } from '../middlewares/rateLimiter';
 import { notFoundHandler } from '../middlewares/notFoundHandler';
@@ -12,6 +13,16 @@ import { ForbiddenError } from '../shared/errors/AppError';
 
 export const createApp = (): Application => {
   const app = express();
+
+  // 0. Request Correlation Tracking (Must precede all middlewares and loggers)
+  app.use(correlationIdMiddleware);
+
+  // Configure reverse proxy trust count for correct IP resolution in rate limiting
+  if (env.TRUST_PROXY) {
+    app.set('trust proxy', env.TRUST_PROXY);
+  } else if (env.NODE_ENV === 'production') {
+    app.set('trust proxy', 1);
+  }
 
   // 1. Security Headers via Helmet
   app.use(helmet());
@@ -45,16 +56,23 @@ export const createApp = (): Application => {
       },
       credentials: true,
       methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-      allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'X-Bypass-Rate-Limit'],
+      allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'X-CSRF-Token'],
     }),
   );
 
   // 3. Rate Limiting Middleware
   app.use(rateLimiter);
 
-  // 4. Request Body Parsers with 10MB limits & Cookie Parser
-  app.use(express.json({ limit: '10mb' }));
-  app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+  // 4. Request Body Parsers with 2MB limits & Cookie Parser
+  app.use(
+    express.json({
+      limit: '2mb',
+      verify: (req: any, _res, buf) => {
+        req.rawBody = buf;
+      },
+    }),
+  );
+  app.use(express.urlencoded({ extended: true, limit: '2mb' }));
   app.use(cookieParser());
 
   // 5. HTTP Request Logging

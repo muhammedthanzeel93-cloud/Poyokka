@@ -5,20 +5,28 @@
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
+    "scheme": "ktour",
     "userInterfaceStyle": "light",
     "splash": {
       "resizeMode": "contain",
       "backgroundColor": "#145C43"
     },
     "ios": {
-      "supportsTablet": true,
-      "bundleIdentifier": "gov.kerala.tourism"
+      "supportsTablet": false,
+      "bundleIdentifier": "gov.kerala.tourism",
+      "buildNumber": "1"
     },
     "android": {
+      "package": "gov.kerala.tourism",
+      "versionCode": 1,
       "adaptiveIcon": {
         "backgroundColor": "#145C43"
       },
-      "package": "gov.kerala.tourism"
+      "permissions": [
+        "INTERNET",
+        "VIBRATE",
+        "RECEIVE_BOOT_COMPLETED"
+      ]
     },
     "web": {
       "favicon": "./assets/favicon.png"

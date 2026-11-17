@@ -1,7 +1,11 @@
 export * from './bookings.types';
 export * from './bookings.validation';
 export * from './bookings.model';
+export * from './inventory-hold.model';
+export * from './idempotency.model';
 export * from './bookings.repository';
 export * from './bookings.service';
+export * from './booking-expiry.service';
 export * from './bookings.controller';
+export * from './bookings.routes';
 export { default as bookingsRoutes } from './bookings.routes';

@@ -15,7 +15,7 @@ import type {
 export interface IAuditLog {
   actorAccountId: Types.ObjectId;
   actorAccountType: AccountType;
-  actorAdminLevel: AdminLevel;
+  actorAdminLevel?: AdminLevel | null;
   action: AdminAuditAction;
   targetEntityId: Types.ObjectId;
   targetEntityType: AuditTargetEntityType;
@@ -52,10 +52,11 @@ const auditLogSchema = new Schema<IAuditLogDocument>(
     actorAdminLevel: {
       type: String,
       enum: {
-        values: Object.values(ADMIN_LEVELS),
+        values: [...Object.values(ADMIN_LEVELS), null],
         message: 'Invalid actor admin level: {VALUE}',
       },
-      required: [true, 'Actor admin level is required'],
+      required: false,
+      default: null,
     },
     action: {
       type: String,

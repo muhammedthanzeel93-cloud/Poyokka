@@ -8,6 +8,9 @@ import { destinationsController } from '../destinations/destinations.controller'
 import { touristCommentRoutes, touristFeedRoutes, touristPostRoutes } from '../posts';
 import { touristReportRoutes } from '../moderation';
 import { touristFollowRoutes } from '../users';
+import { touristBookingRoutes } from '../bookings';
+import { touristPaymentRoutes, touristBookingPaymentRoutes } from '../payments';
+import { touristDeviceRoutes, touristNotificationRoutes } from '../notifications';
 import { ACCOUNT_TYPES } from '@kerala-tourism/constants';
 
 const router = Router();
@@ -41,6 +44,17 @@ router.use('/reports', touristReportRoutes);
 
 // Tourist Follow & Unfollow System (Day 15)
 router.use('/users', touristFollowRoutes);
+
+// Tourist Booking Engine & Inventory Holds (Day 23)
+router.use('/bookings', touristBookingRoutes);
+router.use('/bookings', touristBookingPaymentRoutes);
+
+// Tourist Payment Verification & Read APIs (Day 24)
+router.use('/payments', touristPaymentRoutes);
+
+// Tourist Push Device Registration & Notification Management (Day 26)
+router.use('/devices', touristDeviceRoutes);
+router.use('/notifications', touristNotificationRoutes);
 
 // Tourist Destination Submissions (Day 11)
 router.post(
