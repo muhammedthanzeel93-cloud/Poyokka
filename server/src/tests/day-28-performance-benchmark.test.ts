@@ -15,6 +15,11 @@ import {
   NOTIFICATION_DELIVERY_STATUSES,
   NOTIFICATION_TYPES,
 } from '@kerala-tourism/constants';
+import {
+  resolveTestMongoUri,
+  safeDropTestDatabase,
+  ValidatedTestDatabase,
+} from './test-database-guard';
 
 /**
  * Recursively scans an explain() executionStages tree to find any stage with the given name
@@ -37,46 +42,45 @@ const findStage = (stage: any, name: string): any => {
 
 describe('DAY 28 — Performance Benchmark & Query Optimization Suite', () => {
   let hasLiveMongo = false;
+  let validatedDb: ValidatedTestDatabase | null = null;
 
   const testTouristId = new Types.ObjectId();
   const testBusinessId = new Types.ObjectId();
   const testPropertyId = new Types.ObjectId();
 
   before(async () => {
+    // 1. Resolve & validate TEST_MONGO_URL (fails immediately on missing or unsafe configuration)
+    validatedDb = resolveTestMongoUri();
+
+    // 2. Safely attempt connection to the validated test database
     try {
-      const candidateUri =
-        process.env.TEST_MONGO_URL ||
-        process.env.MONGO_URL ||
-        process.env.MONGODB_URI ||
-        'mongodb://127.0.0.1:27017/kerala_perf_benchmark_test';
+      await mongoose.connect(validatedDb.uri, {
+        serverSelectionTimeoutMS: 1500,
+        connectTimeoutMS: 2000,
+      });
+      hasLiveMongo = true;
+    } catch {
+      // Handle connection failure safely without masking safety-validation errors
+      hasLiveMongo = false;
+    }
 
-      try {
-        await mongoose.connect(candidateUri, {
-          serverSelectionTimeoutMS: 1500,
-          connectTimeoutMS: 2000,
-        });
-        hasLiveMongo = true;
-      } catch {
-        hasLiveMongo = false;
-      }
+    if (hasLiveMongo) {
+      // 3. Destructive cleanup permitted ONLY against the validated test database
+      await safeDropTestDatabase(mongoose.connection, validatedDb);
 
-      if (hasLiveMongo) {
-        // Clean up test database from previous runs
-        await mongoose.connection.dropDatabase().catch(() => {});
+      // Build all indexes
+      await Promise.all([
+        DestinationModel.init(),
+        PostModel.init(),
+        BookingModel.init(),
+        InventoryHoldModel.init(),
+        PaymentModel.init(),
+        NotificationModel.init(),
+        NotificationOutboxModel.init(),
+        PropertyModel.init(),
+      ]);
 
-        // Build all indexes
-        await Promise.all([
-          DestinationModel.init(),
-          PostModel.init(),
-          BookingModel.init(),
-          InventoryHoldModel.init(),
-          PaymentModel.init(),
-          NotificationModel.init(),
-          NotificationOutboxModel.init(),
-          PropertyModel.init(),
-        ]);
-
-        // Seed Representative Datasets
+      // Seed Representative Datasets
         const districts = ['Wayanad', 'Idukki', 'Ernakulam', 'Alappuzha', 'Kozhikode'];
         const destinations = [];
         for (let i = 0; i < 50; i++) {
@@ -202,15 +206,12 @@ describe('DAY 28 — Performance Benchmark & Query Optimization Suite', () => {
         }
         await PropertyModel.insertMany(properties);
       }
-    } catch {
-      // In sandbox mode without TCP network permission, proceed with in-memory schema verification
-    }
   });
 
   after(async () => {
     if (mongoose.connection.readyState !== 0) {
-      if (hasLiveMongo) {
-        await mongoose.connection.dropDatabase().catch(() => {});
+      if (hasLiveMongo && validatedDb) {
+        await safeDropTestDatabase(mongoose.connection, validatedDb);
       }
       await mongoose.disconnect();
     }
@@ -354,8 +355,10 @@ describe('DAY 28 — Performance Benchmark & Query Optimization Suite', () => {
 
   test('3. Explain Plan Execution Verification (Live MongoDB)', async () => {
     if (!hasLiveMongo) {
-      // In sandbox mode without TCP network access, test is verified via schema audit
-      assert.ok(true, 'Live explain plans skipped in sandboxed environment; schema verified');
+      assert.ok(
+        true,
+        'Live explain plans skipped (MongoDB host unreachable at validated TEST_MONGO_URL); schema verified',
+      );
       return;
     }
 
