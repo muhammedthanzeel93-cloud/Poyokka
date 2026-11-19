@@ -68,19 +68,92 @@ export const rawEnvSchema = z
     FIREBASE_PRIVATE_KEY: z.string().optional(),
     FIREBASE_SIMULATED: z.string().default('true'),
   })
-  .refine(
-    (data) => {
-      if (data.NODE_ENV === 'production') {
-        const isDefaultSecret = data.JWT_ACCESS_SECRET === 'kerala-tourism-dev-access-secret-32-chars-minimum';
-        const isPlaceholderRazorpay = data.RAZORPAY_KEY_ID?.includes('placeholder');
-        return !isDefaultSecret && !isPlaceholderRazorpay;
+  .superRefine((data, ctx) => {
+    if (data.NODE_ENV === 'production') {
+      // 1. JWT_ACCESS_SECRET: High-entropy non-default secret
+      if (
+        data.JWT_ACCESS_SECRET === 'kerala-tourism-dev-access-secret-32-chars-minimum' ||
+        data.JWT_ACCESS_SECRET.toLowerCase().includes('placeholder')
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['JWT_ACCESS_SECRET'],
+          message: 'Production deployments must provide a high-entropy, non-default JWT_ACCESS_SECRET (minimum 32 characters)',
+        });
       }
-      return true;
-    },
-    {
-      message: 'Production deployments must provide non-default, production credentials for JWT_ACCESS_SECRET and RAZORPAY_KEY_ID',
-    },
-  );
+
+      // 2. MONGO_URL / MONGODB_URI: Disallow localhost/127.0.0.1 in production
+      const rawMongo = data.MONGO_URL || data.MONGODB_URI;
+      if (!rawMongo) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['MONGO_URL'],
+          message: 'Production deployments require an explicit MONGO_URL or MONGODB_URI',
+        });
+      } else if (rawMongo.includes('127.0.0.1') || rawMongo.includes('localhost')) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['MONGO_URL'],
+          message: 'Production database URI cannot point to localhost or 127.0.0.1; must use production cluster connection string',
+        });
+      }
+
+      // 3. RAZORPAY_KEY_ID: Must be real non-placeholder key
+      if (!data.RAZORPAY_KEY_ID || data.RAZORPAY_KEY_ID.includes('placeholder')) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['RAZORPAY_KEY_ID'],
+          message: 'Production deployments must provide a valid live RAZORPAY_KEY_ID without placeholder values',
+        });
+      }
+
+      // 4. RAZORPAY_KEY_SECRET: Non-placeholder, min length 20
+      if (!data.RAZORPAY_KEY_SECRET || data.RAZORPAY_KEY_SECRET.includes('placeholder') || data.RAZORPAY_KEY_SECRET.length < 20) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['RAZORPAY_KEY_SECRET'],
+          message: 'Production deployments must provide a valid live RAZORPAY_KEY_SECRET (minimum 20 characters)',
+        });
+      }
+
+      // 5. RAZORPAY_WEBHOOK_SECRET: Non-placeholder, min length 20
+      if (!data.RAZORPAY_WEBHOOK_SECRET || data.RAZORPAY_WEBHOOK_SECRET.includes('placeholder') || data.RAZORPAY_WEBHOOK_SECRET.length < 20) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['RAZORPAY_WEBHOOK_SECRET'],
+          message: 'Production deployments must provide a valid RAZORPAY_WEBHOOK_SECRET (minimum 20 characters)',
+        });
+      }
+
+      // 6. CLIENT_URL: Must enforce HTTPS in production
+      if (!data.CLIENT_URL.startsWith('https://')) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['CLIENT_URL'],
+          message: 'Production CLIENT_URL must use HTTPS protocol',
+        });
+      }
+
+      // 7. CORS_ORIGINS: Must enforce HTTPS on all allowed origins in production
+      const origins = (data.CORS_ORIGINS || data.CORS_ORIGIN || '').split(',').map((s) => s.trim()).filter(Boolean);
+      if (origins.length === 0) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['CORS_ORIGINS'],
+          message: 'Production deployments require explicit CORS_ORIGINS',
+        });
+      } else {
+        const hasInsecure = origins.some((origin) => !origin.startsWith('https://'));
+        if (hasInsecure) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ['CORS_ORIGINS'],
+            message: 'All CORS_ORIGINS in production must use HTTPS protocol',
+          });
+        }
+      }
+    }
+  });
 
 export const envSchema = rawEnvSchema.transform((data) => {
   const mongoUrl = data.MONGO_URL || data.MONGODB_URI || 'mongodb://127.0.0.1:27017/kerala_tourism';

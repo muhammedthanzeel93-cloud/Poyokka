@@ -11,7 +11,7 @@
     "web": "expo start --web",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src --ext .ts,.tsx",
-    "test": "tsx --test src/tests/**/*.test.ts"
+    "test": "tsx --test \"src/tests/*.test.ts\" \"src/tests/**/*.test.ts\""
   },
   "dependencies": {
     "@kerala-tourism/api-client": "*",

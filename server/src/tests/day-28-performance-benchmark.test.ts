@@ -1,10 +1,5 @@
 import test, { describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import net from 'net';
-import fs from 'fs';
-import path from 'path';
-import os from 'os';
-import { spawn, ChildProcess } from 'child_process';
 import mongoose, { Types } from 'mongoose';
 
 import { DestinationModel } from '../modules/destinations/destinations.model';
@@ -20,17 +15,6 @@ import {
   NOTIFICATION_DELIVERY_STATUSES,
   NOTIFICATION_TYPES,
 } from '@kerala-tourism/constants';
-
-const getAvailablePort = async (): Promise<number> => {
-  return new Promise((resolve, reject) => {
-    const srv = net.createServer();
-    srv.listen(0, '127.0.0.1', () => {
-      const addr = srv.address() as net.AddressInfo;
-      srv.close(() => resolve(addr.port));
-    });
-    srv.on('error', reject);
-  });
-};
 
 /**
  * Recursively scans an explain() executionStages tree to find any stage with the given name
@@ -52,10 +36,6 @@ const findStage = (stage: any, name: string): any => {
 };
 
 describe('DAY 28 — Performance Benchmark & Query Optimization Suite', () => {
-  let mongodProcess: ChildProcess | null = null;
-  let mongoPort: number;
-  let mongoUri: string;
-  let dbPath: string;
   let hasLiveMongo = false;
 
   const testTouristId = new Types.ObjectId();
@@ -64,40 +44,26 @@ describe('DAY 28 — Performance Benchmark & Query Optimization Suite', () => {
 
   before(async () => {
     try {
-      mongoPort = await getAvailablePort();
-      dbPath = fs.mkdtempSync(path.join(os.tmpdir(), 'mongo-perf-benchmark-'));
+      const candidateUri =
+        process.env.TEST_MONGO_URL ||
+        process.env.MONGO_URL ||
+        process.env.MONGODB_URI ||
+        'mongodb://127.0.0.1:27017/kerala_perf_benchmark_test';
 
-      mongodProcess = spawn(
-        'mongod',
-        [
-          '--bind_ip',
-          '127.0.0.1',
-          '--port',
-          mongoPort.toString(),
-          '--dbpath',
-          dbPath,
-          '--logpath',
-          path.join(dbPath, 'mongod.log'),
-          '--noauth',
-        ],
-        { stdio: 'ignore' },
-      );
-
-      mongoUri = `mongodb://127.0.0.1:${mongoPort}/kerala_perf_benchmark_test?directConnection=true`;
-
-      // Quick connect probe (3 seconds max)
-      const start = Date.now();
-      while (Date.now() - start < 4000) {
-        try {
-          await mongoose.connect(mongoUri, { serverSelectionTimeoutMS: 800 });
-          hasLiveMongo = true;
-          break;
-        } catch {
-          await new Promise((r) => setTimeout(r, 200));
-        }
+      try {
+        await mongoose.connect(candidateUri, {
+          serverSelectionTimeoutMS: 1500,
+          connectTimeoutMS: 2000,
+        });
+        hasLiveMongo = true;
+      } catch {
+        hasLiveMongo = false;
       }
 
       if (hasLiveMongo) {
+        // Clean up test database from previous runs
+        await mongoose.connection.dropDatabase().catch(() => {});
+
         // Build all indexes
         await Promise.all([
           DestinationModel.init(),
@@ -243,15 +209,10 @@ describe('DAY 28 — Performance Benchmark & Query Optimization Suite', () => {
 
   after(async () => {
     if (mongoose.connection.readyState !== 0) {
+      if (hasLiveMongo) {
+        await mongoose.connection.dropDatabase().catch(() => {});
+      }
       await mongoose.disconnect();
-    }
-    if (mongodProcess) {
-      mongodProcess.kill('SIGKILL');
-    }
-    try {
-      if (dbPath) fs.rmSync(dbPath, { recursive: true, force: true });
-    } catch {
-      // Ignore cleanup error
     }
   });
 

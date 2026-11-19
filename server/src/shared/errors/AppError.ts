@@ -92,3 +92,28 @@ export class InternalServerError extends AppError {
     super(message, 500, 'INTERNAL_SERVER_ERROR', details, false);
   }
 }
+
+export class BadGatewayError extends AppError {
+  constructor(
+    message = 'Bad gateway error from upstream provider',
+    codeOrDetails: string | unknown = 'BAD_GATEWAY',
+    details?: unknown,
+  ) {
+    const code = typeof codeOrDetails === 'string' ? codeOrDetails : 'BAD_GATEWAY';
+    const finalDetails = typeof codeOrDetails === 'string' ? details : codeOrDetails;
+    super(message, 502, code, finalDetails, true);
+  }
+}
+
+export class GatewayTimeoutError extends AppError {
+  constructor(
+    message = 'Gateway timeout waiting for upstream provider',
+    codeOrDetails: string | unknown = 'GATEWAY_TIMEOUT',
+    details?: unknown,
+  ) {
+    const code = typeof codeOrDetails === 'string' ? codeOrDetails : 'GATEWAY_TIMEOUT';
+    const finalDetails = typeof codeOrDetails === 'string' ? details : codeOrDetails;
+    super(message, 504, code, finalDetails, true);
+  }
+}
+

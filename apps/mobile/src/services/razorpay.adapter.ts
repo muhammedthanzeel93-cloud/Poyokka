@@ -132,7 +132,14 @@ class RazorpayMobileAdapter {
     }
 
     // 3. Fallback for Expo Go sandbox development
-    // Simulates successful sandbox completion with deterministic test signature
+    // Strictly prohibited in production release builds
+    if (typeof __DEV__ !== 'undefined' && !__DEV__) {
+      throw new RazorpayCheckoutError(
+        'Native Razorpay checkout module is unavailable in production build',
+        'GATEWAY_UNAVAILABLE',
+      );
+    }
+
     return this.fallbackSandboxCheckout(options);
   }
 

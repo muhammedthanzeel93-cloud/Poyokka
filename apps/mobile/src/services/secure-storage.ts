@@ -37,10 +37,19 @@ class MemorySecureStorage implements ISecureStorage {
   }
 }
 
-class SecureStorageService implements ISecureStorage {
+export class SecureStorageService implements ISecureStorage {
   private fallbackStore = new MemorySecureStorage();
   private nativeModule: any = null;
   private isNativeChecked = false;
+
+  private isReleaseEnvironment(): boolean {
+    return typeof __DEV__ !== 'undefined' && !__DEV__;
+  }
+
+  public setNativeModuleForTesting(mockNative: any): void {
+    this.nativeModule = mockNative;
+    this.isNativeChecked = true;
+  }
 
   private getNativeStore(): any {
     if (this.isNativeChecked) {
@@ -68,9 +77,16 @@ class SecureStorageService implements ISecureStorage {
     if (nativeStore) {
       try {
         return await nativeStore.getItemAsync(key);
-      } catch {
+      } catch (err: unknown) {
+        if (this.isReleaseEnvironment()) {
+          throw new Error(`[SecureStorage] Hardware secure storage read failure: ${(err as Error).message}`);
+        }
         return this.fallbackStore.getItemAsync(key);
       }
+    }
+
+    if (this.isReleaseEnvironment()) {
+      throw new Error('[SecureStorage] Hardware secure storage is unavailable in production build');
     }
     return this.fallbackStore.getItemAsync(key);
   }
@@ -81,10 +97,17 @@ class SecureStorageService implements ISecureStorage {
       try {
         await nativeStore.setItemAsync(key, value);
         return;
-      } catch {
+      } catch (err: unknown) {
+        if (this.isReleaseEnvironment()) {
+          throw new Error(`[SecureStorage] Hardware secure storage write failure: ${(err as Error).message}`);
+        }
         await this.fallbackStore.setItemAsync(key, value);
         return;
       }
+    }
+
+    if (this.isReleaseEnvironment()) {
+      throw new Error('[SecureStorage] Hardware secure storage is unavailable in production build');
     }
     await this.fallbackStore.setItemAsync(key, value);
   }
@@ -95,10 +118,17 @@ class SecureStorageService implements ISecureStorage {
       try {
         await nativeStore.deleteItemAsync(key);
         return;
-      } catch {
+      } catch (err: unknown) {
+        if (this.isReleaseEnvironment()) {
+          throw new Error(`[SecureStorage] Hardware secure storage delete failure: ${(err as Error).message}`);
+        }
         await this.fallbackStore.deleteItemAsync(key);
         return;
       }
+    }
+
+    if (this.isReleaseEnvironment()) {
+      throw new Error('[SecureStorage] Hardware secure storage is unavailable in production build');
     }
     await this.fallbackStore.deleteItemAsync(key);
   }
@@ -108,6 +138,8 @@ class SecureStorageService implements ISecureStorage {
    */
   resetForTesting(): void {
     this.fallbackStore.clear();
+    this.nativeModule = null;
+    this.isNativeChecked = false;
   }
 }
 

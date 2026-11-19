@@ -93,7 +93,7 @@ jobs:
         run: npm ci
 
       - name: Run mobile unit & integration tests
-        run: npm run test --workspace=@kerala-tourism/mobile
+        run: npm run test:mobile
 
   build-artifacts:
     name: Build Verification

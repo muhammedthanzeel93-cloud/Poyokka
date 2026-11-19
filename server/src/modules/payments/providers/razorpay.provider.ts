@@ -1,5 +1,6 @@
 import crypto from 'crypto';
 import { PAYMENT_PROVIDERS } from '@kerala-tourism/constants';
+import { AppError, BadGatewayError } from '../../../shared/errors/AppError';
 import {
   IPaymentProvider,
   CreateProviderOrderInput,
@@ -16,12 +17,12 @@ export class RazorpayPaymentProvider implements IPaymentProvider {
     private readonly keyId: string,
     private readonly keySecret: string,
     private readonly webhookSecret: string,
-    private readonly isSimulated: boolean = true,
+    private readonly isSimulated: boolean = false,
   ) {}
 
   public async createOrder(input: CreateProviderOrderInput): Promise<ProviderOrderResult> {
-    // If running in sandbox simulation mode (or placeholders without live gateway)
-    if (this.isSimulated || this.keyId.includes('placeholder')) {
+    // If running in sandbox simulation mode (strictly prohibited in production)
+    if (this.isSimulated) {
       const orderId = `order_${crypto.randomBytes(8).toString('hex')}`;
       return {
         orderId,
@@ -40,6 +41,7 @@ export class RazorpayPaymentProvider implements IPaymentProvider {
           attempts: 0,
           notes: input.notes || {},
           created_at: Math.floor(Date.now() / 1000),
+          simulated: true,
         },
       };
     }
@@ -55,7 +57,7 @@ export class RazorpayPaymentProvider implements IPaymentProvider {
         },
         body: JSON.stringify({
           amount: input.amountPaise,
-          currency: input.currency,
+          currency: input.currency || 'INR',
           receipt: input.receipt,
           notes: input.notes,
         }),
@@ -63,7 +65,11 @@ export class RazorpayPaymentProvider implements IPaymentProvider {
 
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({}));
-        throw new Error(`Razorpay order creation failed: ${JSON.stringify(errorData)}`);
+        const description = (errorData as any)?.error?.description || `HTTP ${response.status}`;
+        throw new BadGatewayError(`Razorpay order creation failed: ${description}`, 'PAYMENT_GATEWAY_ERROR', {
+          status: response.status,
+          code: (errorData as any)?.error?.code,
+        });
       }
 
       const data = (await response.json()) as any;
@@ -75,15 +81,14 @@ export class RazorpayPaymentProvider implements IPaymentProvider {
         rawResponse: data,
       };
     } catch (err: unknown) {
-      // In offline sandboxed automated tests, fallback to simulated order
-      const orderId = `order_${crypto.randomBytes(8).toString('hex')}`;
-      return {
-        orderId,
-        amountPaise: input.amountPaise,
-        currency: input.currency || 'INR',
-        status: 'created',
-        rawResponse: { simulated: true, originalError: String(err) },
-      };
+      if (err instanceof AppError) {
+        throw err;
+      }
+      const safeMsg = err instanceof Error ? err.message : 'Unknown network error';
+      throw new BadGatewayError(
+        `Payment gateway communication failure during order creation: ${safeMsg}`,
+        'PAYMENT_GATEWAY_NETWORK_ERROR',
+      );
     }
   }
 
@@ -140,7 +145,7 @@ export class RazorpayPaymentProvider implements IPaymentProvider {
   }
 
   public async fetchPayment(providerPaymentId: string): Promise<ProviderPaymentResult> {
-    if (this.isSimulated || this.keyId.includes('placeholder')) {
+    if (this.isSimulated) {
       return {
         providerPaymentId,
         providerOrderId: `order_${crypto.randomBytes(8).toString('hex')}`,
@@ -161,7 +166,12 @@ export class RazorpayPaymentProvider implements IPaymentProvider {
       });
 
       if (!response.ok) {
-        throw new Error(`Razorpay fetch payment failed with status ${response.status}`);
+        const errorData = await response.json().catch(() => ({}));
+        const description = (errorData as any)?.error?.description || `HTTP ${response.status}`;
+        throw new BadGatewayError(`Razorpay fetch payment failed: ${description}`, 'PAYMENT_GATEWAY_ERROR', {
+          status: response.status,
+          code: (errorData as any)?.error?.code,
+        });
       }
 
       const data = (await response.json()) as any;
@@ -176,14 +186,15 @@ export class RazorpayPaymentProvider implements IPaymentProvider {
         errorDescription: data.error_description,
         rawResponse: data,
       };
-    } catch {
-      return {
-        providerPaymentId,
-        providerOrderId: `order_${crypto.randomBytes(8).toString('hex')}`,
-        amountPaise: 500000,
-        currency: 'INR',
-        status: 'captured',
-      };
+    } catch (err: unknown) {
+      if (err instanceof AppError) {
+        throw err;
+      }
+      const safeMsg = err instanceof Error ? err.message : 'Unknown network error';
+      throw new BadGatewayError(
+        `Payment gateway communication failure during payment verification: ${safeMsg}`,
+        'PAYMENT_GATEWAY_NETWORK_ERROR',
+      );
     }
   }
 }

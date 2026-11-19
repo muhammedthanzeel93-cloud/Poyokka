@@ -152,4 +152,53 @@ describe('Mobile Authentication & Secure Storage Suite', () => {
     const stored = await secureStorage.getItemAsync('kt_mobile_refresh_token');
     assert.equal(stored, null, 'Stored refresh token must be deleted');
   });
+
+  test('6. Production Hardening: Keystore Write Failure Throws in Release Mode', async () => {
+    (global as any).__DEV__ = false;
+
+    // Simulate native keystore throwing a cryptographic hardware error
+    secureStorage.setNativeModuleForTesting({
+      setItemAsync: async () => {
+        throw new Error('KEYSTORE_LOCKED_OR_TAMPERED');
+      },
+      getItemAsync: async () => {
+        throw new Error('KEYSTORE_LOCKED_OR_TAMPERED');
+      },
+      deleteItemAsync: async () => {
+        throw new Error('KEYSTORE_LOCKED_OR_TAMPERED');
+      },
+    });
+
+    await assert.rejects(
+      async () => {
+        await secureStorage.setItemAsync('token', 'val');
+      },
+      (err: Error) => {
+        assert.ok(err.message.includes('[SecureStorage] Hardware secure storage write failure'));
+        return true;
+      },
+      'Write failure must throw rather than silently masking error in production',
+    );
+
+    delete (global as any).__DEV__;
+  });
+
+  test('7. Production Hardening: Missing Native Keystore Throws in Release Mode', async () => {
+    (global as any).__DEV__ = false;
+    secureStorage.setNativeModuleForTesting(null);
+
+    await assert.rejects(
+      async () => {
+        await secureStorage.setItemAsync('token', 'val');
+      },
+      (err: Error) => {
+        assert.ok(err.message.includes('[SecureStorage] Hardware secure storage is unavailable'));
+        return true;
+      },
+      'Missing hardware keystore must throw in release mode',
+    );
+
+    delete (global as any).__DEV__;
+  });
 });
+
