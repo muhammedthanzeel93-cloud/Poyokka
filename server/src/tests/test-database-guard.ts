@@ -64,6 +64,30 @@ export function extractHostname(hostString: string): string {
   return trimmed.split(':')[0].toLowerCase();
 }
 
+/**
+ * Extracts port number from host string if present, or returns default MongoDB port (27017).
+ */
+export function extractPort(hostString: string, defaultPort = 27017): number {
+  const trimmed = hostString.trim();
+  if (trimmed.startsWith('[')) {
+    const endBracket = trimmed.indexOf(']');
+    if (endBracket !== -1) {
+      const rest = trimmed.slice(endBracket + 1);
+      if (rest.startsWith(':')) {
+        const p = parseInt(rest.slice(1), 10);
+        if (!isNaN(p)) return p;
+      }
+      return defaultPort;
+    }
+  }
+  const parts = trimmed.split(':');
+  if (parts.length > 1) {
+    const p = parseInt(parts[parts.length - 1], 10);
+    if (!isNaN(p)) return p;
+  }
+  return defaultPort;
+}
+
 interface ParsedMongoUriParts {
   protocol: string;
   hosts: string[];
@@ -180,9 +204,18 @@ export function validateHostPolicy(
       continue;
     }
 
-    // 3. For remote hosts, enforce exact match in TEST_MONGO_ALLOWED_HOSTS
-    const isApprovedRemote =
+    // 3. For remote hosts, enforce match in TEST_MONGO_ALLOWED_HOSTS (exact match or cluster domain member)
+    let isApprovedRemote =
       allowedRemoteHosts.has(hostLower) || allowedRemoteHosts.has(hostname);
+
+    if (!isApprovedRemote) {
+      for (const allowed of allowedRemoteHosts) {
+        if (hostname.endsWith(`.${allowed}`)) {
+          isApprovedRemote = true;
+          break;
+        }
+      }
+    }
 
     if (!isApprovedRemote) {
       if (allowedRemoteHosts.size === 0) {
@@ -275,13 +308,135 @@ export function resolveTestMongoUri(
   return validateTestDatabaseUri(testMongoUrl, allowedHosts);
 }
 
+interface ClientWithTopology {
+  client?: {
+    s?: { options?: { hosts?: Array<{ host?: string; port?: number; toString?: () => string }> } };
+    topology?: { description?: { servers?: Map<string, unknown> | Record<string, unknown> } };
+  };
+}
+
+/**
+ * Safely extracts all actual connected hosts from a Mongoose Connection and its underlying MongoClient/Topology.
+ * Returns normalized host strings.
+ */
+export function extractActualConnectionHosts(connection: mongoose.Connection): string[] {
+  const hostSet = new Set<string>();
+
+  // 1. Inspect driver TopologyDescription servers map (live connected/discovered servers)
+  const client = (connection as unknown as ClientWithTopology).client;
+  const serversMap = client?.topology?.description?.servers;
+  if (serversMap) {
+    if (typeof serversMap.keys === 'function') {
+      for (const serverAddress of serversMap.keys()) {
+        if (typeof serverAddress === 'string' && serverAddress.trim()) {
+          hostSet.add(serverAddress.trim().toLowerCase());
+        }
+      }
+    } else if (typeof serversMap === 'object') {
+      for (const serverAddress of Object.keys(serversMap)) {
+        if (typeof serverAddress === 'string' && serverAddress.trim()) {
+          hostSet.add(serverAddress.trim().toLowerCase());
+        }
+      }
+    }
+  }
+
+  // 2. Inspect MongoClient options hosts (parsed seedlist)
+  const clientHosts = client?.s?.options?.hosts;
+  if (Array.isArray(clientHosts)) {
+    for (const h of clientHosts) {
+      if (h) {
+        if (typeof h.toString === 'function' && h.toString() !== '[object Object]') {
+          hostSet.add(h.toString().trim().toLowerCase());
+        } else if (typeof h.host === 'string' && h.host.trim()) {
+          const portPart = typeof h.port === 'number' ? `:${h.port}` : '';
+          hostSet.add(`${h.host.trim()}${portPart}`.toLowerCase());
+        }
+      }
+    }
+  }
+
+  // 3. Inspect connection.host and connection.port
+  if (typeof connection.host === 'string' && connection.host.trim()) {
+    const portPart = typeof connection.port === 'number' ? `:${connection.port}` : '';
+    hostSet.add(`${connection.host.trim()}${portPart}`.toLowerCase());
+  }
+
+  return Array.from(hostSet);
+}
+
+/**
+ * Verifies that the actual connected MongoDB deployment host(s) strictly match
+ * the validated test database configuration.
+ * Fails closed if host identity cannot be established or if any actual host is unauthorized.
+ */
+export function verifyConnectionHostIdentity(
+  actualHosts: string[],
+  expected: ValidatedTestDatabase,
+  allowedHostsEnv?: string,
+): void {
+  if (!actualHosts || actualHosts.length === 0) {
+    throw new TestDatabaseSafetyError(
+      'Cannot drop database: unable to establish connection host identity reliably. No host information exposed on connection.',
+    );
+  }
+
+  const isSrv = expected.protocol === 'mongodb+srv:';
+  const expectedSrvDomain = isSrv && expected.hosts[0] ? extractHostname(expected.hosts[0]) : null;
+
+  for (const actualHost of actualHosts) {
+    const actualHostname = extractHostname(actualHost);
+    const actualPort = extractPort(actualHost);
+
+    // 1. Unconditionally reject production-like keywords
+    for (const forbidden of FORBIDDEN_HOST_KEYWORDS) {
+      if (actualHostname.includes(forbidden) || actualHost.toLowerCase().includes(forbidden)) {
+        throw new TestDatabaseSafetyError(
+          `Connected host "${actualHost}" contains forbidden production keyword "${forbidden}". Destructive cleanup aborted.`,
+        );
+      }
+    }
+
+    // 2. Check if actualHost matches the expected configuration
+    let matchesExpected = false;
+
+    if (isSrv && expectedSrvDomain) {
+      // For SRV, the node must either equal the SRV domain or be a subdomain of the SRV domain
+      if (actualHostname === expectedSrvDomain || actualHostname.endsWith(`.${expectedSrvDomain}`)) {
+        matchesExpected = true;
+      }
+    } else {
+      // For standard mongodb:// connections, check against expected.hosts
+      for (const expHost of expected.hosts) {
+        const expHostname = extractHostname(expHost);
+        const expPort = extractPort(expHost);
+
+        if (actualHostname === expHostname && actualPort === expPort) {
+          matchesExpected = true;
+          break;
+        }
+      }
+    }
+
+    if (!matchesExpected) {
+      throw new TestDatabaseSafetyError(
+        `Connected host "${actualHost}" does not match any validated host in expected test configuration: [${expected.hosts.join(', ')}]. Destructive cleanup aborted.`,
+      );
+    }
+
+    // 3. Confirm actual host passes host isolation policy
+    validateHostPolicy([actualHost], allowedHostsEnv);
+  }
+}
+
 /**
  * Performs guarded destructive cleanup (dropDatabase) on a validated test database connection.
- * Guarantees that dropDatabase is never called on an invalid, unverified, or general application database.
+ * Guarantees that dropDatabase is never called on an invalid, unverified, or mismatched host/database.
  */
 export async function safeDropTestDatabase(
   connection: mongoose.Connection,
   expected: ValidatedTestDatabase,
+  allowedHostsEnv?: string,
 ): Promise<void> {
   if (connection.readyState !== 1) {
     throw new TestDatabaseSafetyError(
@@ -315,6 +470,10 @@ export async function safeDropTestDatabase(
       );
     }
   }
+
+  // Verify actual connection host identity against validated configuration
+  const actualHosts = extractActualConnectionHosts(connection);
+  verifyConnectionHostIdentity(actualHosts, expected, allowedHostsEnv);
 
   await connection.dropDatabase();
 }

@@ -7,10 +7,13 @@ import {
   safeDropTestDatabase,
   redactMongoUri,
   extractHostname,
+  extractPort,
+  extractActualConnectionHosts,
+  verifyConnectionHostIdentity,
   TestDatabaseSafetyError,
 } from './test-database-guard';
 
-describe('T01.1 & T01.1.1 — Test Database Isolation & Safety Guard Suite', () => {
+describe('T01.1 & T01.1.1 & T01.1.2 — Test Database Isolation & Host Guard Suite', () => {
   // =========================================================================
   // 1. Environment Variable Fallback Prevention
   // =========================================================================
@@ -373,49 +376,176 @@ describe('T01.1 & T01.1.1 — Test Database Isolation & Safety Guard Suite', () 
   });
 
   // =========================================================================
-  // 6. Destructive Cleanup Safeguards
+  // 6. Actual Connection Host Verification & Regression Suite (T01.1.2-A & B)
   // =========================================================================
-  test('13. dropDatabase() is never called for invalid configurations or mismatched connections', async () => {
-    let dropCalled = false;
+  interface MockConnectionOptions {
+    readyState?: number;
+    name?: string;
+    host?: string;
+    port?: number;
+    servers?: string[];
+    clientHosts?: Array<{ host: string; port?: number; toString?: () => string }>;
+    onDrop?: () => void;
+  }
 
-    // Production connection mock
-    const fakeProdConnection = {
-      readyState: 1,
-      name: 'kerala_tourism',
-      dropDatabase: async () => {
-        dropCalled = true;
-      },
-    } as unknown as mongoose.Connection;
+  function createMockConnection(opts: MockConnectionOptions): mongoose.Connection {
+    let serversMap: Map<string, unknown> | undefined;
+    if (opts.servers) {
+      serversMap = new Map();
+      for (const s of opts.servers) {
+        serversMap.set(s, {});
+      }
+    }
 
-    const validatedConfig = {
-      uri: 'mongodb://127.0.0.1:27017/kerala_perf_benchmark_test',
-      redactedUri: 'mongodb://127.0.0.1:27017/kerala_perf_benchmark_test',
-      dbName: 'kerala_perf_benchmark_test',
-      hosts: ['127.0.0.1:27017'],
-      protocol: 'mongodb:',
+    const client = {
+      topology: serversMap ? { description: { servers: serversMap } } : undefined,
+      s: opts.clientHosts ? { options: { hosts: opts.clientHosts } } : undefined,
     };
 
+    return {
+      readyState: opts.readyState !== undefined ? opts.readyState : 1,
+      name: opts.name,
+      host: opts.host,
+      port: opts.port,
+      client: client.topology || client.s ? client : undefined,
+      dropDatabase: async () => {
+        if (opts.onDrop) opts.onDrop();
+      },
+    } as unknown as mongoose.Connection;
+  }
+
+  const standardValidatedDb = {
+    uri: 'mongodb://127.0.0.1:27017/kerala_perf_benchmark_test',
+    redactedUri: 'mongodb://127.0.0.1:27017/kerala_perf_benchmark_test',
+    dbName: 'kerala_perf_benchmark_test',
+    hosts: ['127.0.0.1:27017'],
+    protocol: 'mongodb:',
+  };
+
+  test('13. Host Mismatch 1: Database name matches, but connected host differs -> rejected and no dropDatabase', async () => {
+    let dropCalled = false;
+    const mismatchedHostConn = createMockConnection({
+      readyState: 1,
+      name: 'kerala_perf_benchmark_test',
+      host: '192.168.1.100',
+      port: 27017,
+      onDrop: () => {
+        dropCalled = true;
+      },
+    });
+
     await assert.rejects(
-      () => safeDropTestDatabase(fakeProdConnection, validatedConfig),
+      () => safeDropTestDatabase(mismatchedHostConn, standardValidatedDb),
       (err: unknown) => {
         assert.ok(err instanceof TestDatabaseSafetyError);
-        assert.match(err.message, /does not match expected validated test database name/);
+        assert.match(err.message, /Connected host "192\.168\.1\.100:27017" does not match any validated host/);
         return true;
       },
     );
-    assert.strictEqual(dropCalled, false, 'dropDatabase must NEVER be called on mismatched connection');
+    assert.strictEqual(dropCalled, false, 'dropDatabase must NEVER be called when connected host differs');
+  });
 
-    // Inactive connection mock
-    const disconnectedConn = {
-      readyState: 0,
+  test('14. Host Mismatch 2: Validated URI is authorized, but connection reports unauthorized host -> rejected and no dropDatabase', async () => {
+    let dropCalled = false;
+    const authorizedRemoteDb = {
+      uri: 'mongodb://test-cluster.internal:27017/kerala_perf_benchmark_test',
+      redactedUri: 'mongodb://test-cluster.internal:27017/kerala_perf_benchmark_test',
+      dbName: 'kerala_perf_benchmark_test',
+      hosts: ['test-cluster.internal:27017'],
+      protocol: 'mongodb:',
+    };
+
+    // Connection unexpectedly connected to a different or rogue server
+    const rogueConn = createMockConnection({
+      readyState: 1,
       name: 'kerala_perf_benchmark_test',
-      dropDatabase: async () => {
+      host: 'rogue-server.internal',
+      port: 27017,
+      onDrop: () => {
         dropCalled = true;
       },
-    } as unknown as mongoose.Connection;
+    });
 
     await assert.rejects(
-      () => safeDropTestDatabase(disconnectedConn, validatedConfig),
+      () => safeDropTestDatabase(rogueConn, authorizedRemoteDb, 'test-cluster.internal'),
+      (err: unknown) => {
+        assert.ok(err instanceof TestDatabaseSafetyError);
+        assert.match(err.message, /Connected host "rogue-server\.internal:27017" does not match any validated host/);
+        return true;
+      },
+    );
+    assert.strictEqual(dropCalled, false, 'dropDatabase must NEVER be called on unauthorized connection');
+  });
+
+  test('15. Host Mismatch 3: Replica-set connection contains unexpected member -> rejected and no dropDatabase', async () => {
+    let dropCalled = false;
+    const replicaSetDb = {
+      uri: 'mongodb://node1.test.local:27017,node2.test.local:27017/kerala_perf_benchmark_test',
+      redactedUri: 'mongodb://node1.test.local:27017,node2.test.local:27017/kerala_perf_benchmark_test',
+      dbName: 'kerala_perf_benchmark_test',
+      hosts: ['node1.test.local:27017', 'node2.test.local:27017'],
+      protocol: 'mongodb:',
+    };
+
+    // Active connection topology discovered an unexpected node3
+    const unexpectedReplicaConn = createMockConnection({
+      readyState: 1,
+      name: 'kerala_perf_benchmark_test',
+      servers: ['node1.test.local:27017', 'node3.unexpected.local:27017'],
+      onDrop: () => {
+        dropCalled = true;
+      },
+    });
+
+    await assert.rejects(
+      () => safeDropTestDatabase(unexpectedReplicaConn, replicaSetDb, 'node1.test.local,node2.test.local'),
+      (err: unknown) => {
+        assert.ok(err instanceof TestDatabaseSafetyError);
+        assert.match(err.message, /Connected host "node3\.unexpected\.local:27017" does not match/);
+        return true;
+      },
+    );
+    assert.strictEqual(dropCalled, false, 'dropDatabase must NEVER be called if replica set contains unexpected member');
+  });
+
+  test('16. Host Mismatch 4: Actual host identity is missing or cannot be verified -> fail closed, no dropDatabase', async () => {
+    let dropCalled = false;
+    // Connection missing host, port, and client topology
+    const anonymousConn = createMockConnection({
+      readyState: 1,
+      name: 'kerala_perf_benchmark_test',
+      host: undefined,
+      port: undefined,
+      onDrop: () => {
+        dropCalled = true;
+      },
+    });
+
+    await assert.rejects(
+      () => safeDropTestDatabase(anonymousConn, standardValidatedDb),
+      (err: unknown) => {
+        assert.ok(err instanceof TestDatabaseSafetyError);
+        assert.match(err.message, /unable to establish connection host identity reliably/);
+        return true;
+      },
+    );
+    assert.strictEqual(dropCalled, false, 'dropDatabase must NEVER be called when host identity is unverified');
+  });
+
+  test('17. Inactive Connection 5: Connection is disconnected -> rejected, no dropDatabase', async () => {
+    let dropCalled = false;
+    const disconnectedConn = createMockConnection({
+      readyState: 0,
+      name: 'kerala_perf_benchmark_test',
+      host: '127.0.0.1',
+      port: 27017,
+      onDrop: () => {
+        dropCalled = true;
+      },
+    });
+
+    await assert.rejects(
+      () => safeDropTestDatabase(disconnectedConn, standardValidatedDb),
       (err: unknown) => {
         assert.ok(err instanceof TestDatabaseSafetyError);
         assert.match(err.message, /connection is not active/);
@@ -425,33 +555,121 @@ describe('T01.1 & T01.1.1 — Test Database Isolation & Safety Guard Suite', () 
     assert.strictEqual(dropCalled, false, 'dropDatabase must NEVER be called on inactive connection');
   });
 
-  test('14. Cleanup is performed only against the validated test database', async () => {
+  test('18. Database Mismatch 6: Database name does not match -> rejected, no dropDatabase', async () => {
     let dropCalled = false;
-
-    const validConnection = {
+    const mismatchedDbConn = createMockConnection({
       readyState: 1,
-      name: 'kerala_perf_benchmark_test',
-      dropDatabase: async () => {
+      name: 'kerala_other_test',
+      host: '127.0.0.1',
+      port: 27017,
+      onDrop: () => {
         dropCalled = true;
       },
-    } as unknown as mongoose.Connection;
+    });
 
-    const validatedConfig = {
-      uri: 'mongodb://127.0.0.1:27017/kerala_perf_benchmark_test',
-      redactedUri: 'mongodb://127.0.0.1:27017/kerala_perf_benchmark_test',
-      dbName: 'kerala_perf_benchmark_test',
-      hosts: ['127.0.0.1:27017'],
-      protocol: 'mongodb:',
-    };
-
-    await safeDropTestDatabase(validConnection, validatedConfig);
-    assert.strictEqual(dropCalled, true, 'dropDatabase should be called when all safety invariants pass');
+    await assert.rejects(
+      () => safeDropTestDatabase(mismatchedDbConn, standardValidatedDb),
+      (err: unknown) => {
+        assert.ok(err instanceof TestDatabaseSafetyError);
+        assert.match(err.message, /does not match expected validated test database name/);
+        return true;
+      },
+    );
+    assert.strictEqual(dropCalled, false, 'dropDatabase must NEVER be called when database name mismatches');
   });
 
-  test('15. Host helper extractHostname correctly parses host strings', () => {
+  test('19. Success 7: Host and database name both match and all safety checks pass -> dropDatabase executed', async () => {
+    let dropCalled = false;
+    const matchingConn = createMockConnection({
+      readyState: 1,
+      name: 'kerala_perf_benchmark_test',
+      host: '127.0.0.1',
+      port: 27017,
+      onDrop: () => {
+        dropCalled = true;
+      },
+    });
+
+    await safeDropTestDatabase(matchingConn, standardValidatedDb);
+    assert.strictEqual(dropCalled, true, 'dropDatabase MUST be called when all safety checks and host matches pass');
+  });
+
+  test('20. SRV Cluster verification allows matching subdomain members', async () => {
+    let dropCalled = false;
+    const srvDb = {
+      uri: 'mongodb+srv://cluster.internal.test/kerala_perf_benchmark_test',
+      redactedUri: 'mongodb+srv://cluster.internal.test/kerala_perf_benchmark_test',
+      dbName: 'kerala_perf_benchmark_test',
+      hosts: ['cluster.internal.test'],
+      protocol: 'mongodb+srv:',
+    };
+
+    const srvConn = createMockConnection({
+      readyState: 1,
+      name: 'kerala_perf_benchmark_test',
+      servers: ['node1.cluster.internal.test:27017', 'node2.cluster.internal.test:27017'],
+      onDrop: () => {
+        dropCalled = true;
+      },
+    });
+
+    await safeDropTestDatabase(srvConn, srvDb, 'cluster.internal.test');
+    assert.strictEqual(dropCalled, true, 'dropDatabase should succeed for verified SRV cluster members');
+  });
+
+  test('21. Production keyword in connected host is rejected even if DB name passes', async () => {
+    let dropCalled = false;
+    const prodConnectedConn = createMockConnection({
+      readyState: 1,
+      name: 'kerala_perf_benchmark_test',
+      host: 'production-db.internal',
+      port: 27017,
+      onDrop: () => {
+        dropCalled = true;
+      },
+    });
+
+    await assert.rejects(
+      () => safeDropTestDatabase(prodConnectedConn, standardValidatedDb),
+      (err: unknown) => {
+        assert.ok(err instanceof TestDatabaseSafetyError);
+        assert.match(err.message, /contains forbidden production keyword/);
+        return true;
+      },
+    );
+    assert.strictEqual(dropCalled, false, 'dropDatabase must NEVER be called on production-named host');
+  });
+
+  // =========================================================================
+  // 7. Host Utility Helpers
+  // =========================================================================
+  test('22. Host helpers extractHostname, extractPort, extractActualConnectionHosts, and verifyConnectionHostIdentity', () => {
     assert.strictEqual(extractHostname('localhost:27017'), 'localhost');
     assert.strictEqual(extractHostname('127.0.0.1'), '127.0.0.1');
     assert.strictEqual(extractHostname('[::1]:27017'), '::1');
     assert.strictEqual(extractHostname('cluster.mongodb.net'), 'cluster.mongodb.net');
+
+    assert.strictEqual(extractPort('localhost:27017'), 27017);
+    assert.strictEqual(extractPort('localhost'), 27017);
+    assert.strictEqual(extractPort('127.0.0.1:28018'), 28018);
+    assert.strictEqual(extractPort('[::1]:27019'), 27019);
+
+    const testConn = createMockConnection({
+      host: '127.0.0.1',
+      port: 27017,
+      servers: ['127.0.0.1:27017'],
+      clientHosts: [{ host: '127.0.0.1', port: 27017 }],
+    });
+    const extracted = extractActualConnectionHosts(testConn);
+    assert.deepStrictEqual(extracted, ['127.0.0.1:27017']);
+
+    // verifyConnectionHostIdentity direct verification
+    assert.doesNotThrow(() => {
+      verifyConnectionHostIdentity(['127.0.0.1:27017'], standardValidatedDb);
+    });
+    assert.throws(
+      () => verifyConnectionHostIdentity([], standardValidatedDb),
+      /unable to establish connection host identity reliably/,
+    );
   });
 });
