@@ -353,11 +353,15 @@ describe('DAY 28 — Performance Benchmark & Query Optimization Suite', () => {
     assert.ok(hasPostFeed, 'PostModel must declare compound index idx_public_feed on published feed');
   });
 
-  test('3. Explain Plan Execution Verification (Live MongoDB)', async () => {
+  test('3. Explain Plan Execution Verification (Live MongoDB)', async (t) => {
     if (!hasLiveMongo) {
-      assert.ok(
-        true,
-        'Live explain plans skipped (MongoDB host unreachable at validated TEST_MONGO_URL); schema verified',
+      if (process.env.REQUIRE_LIVE_MONGO === 'true') {
+        assert.fail(
+          'Live MongoDB connection is required by REQUIRE_LIVE_MONGO=true, but connection could not be established to the validated test database.',
+        );
+      }
+      t.skip(
+        'Live MongoDB is unreachable at the validated TEST_MONGO_URL. Live explain plan execution skipped.',
       );
       return;
     }
