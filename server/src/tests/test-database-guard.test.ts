@@ -13,7 +13,7 @@ import {
   TestDatabaseSafetyError,
 } from './test-database-guard';
 
-describe('T01.1 & T01.1.1 & T01.1.2 — Test Database Isolation & Host Guard Suite', () => {
+describe('T01.1 & T01.1.1 & T01.1.2 & T01.1.2-R1 — Test Database Isolation & Host Guard Suite', () => {
   // =========================================================================
   // 1. Environment Variable Fallback Prevention
   // =========================================================================
@@ -197,17 +197,14 @@ describe('T01.1 & T01.1.1 & T01.1.2 — Test Database Isolation & Host Guard Sui
   // 4. Host Isolation Policy (T01.1.1-A)
   // =========================================================================
   test('6. Approved local MongoDB test hosts are accepted without extra configuration', () => {
-    // 127.0.0.1
     const res1 = validateTestDatabaseUri('mongodb://127.0.0.1:27017/perf_test');
     assert.strictEqual(res1.dbName, 'perf_test');
     assert.deepStrictEqual(res1.hosts, ['127.0.0.1:27017']);
 
-    // localhost
     const res2 = validateTestDatabaseUri('mongodb://localhost:27017/perf_test');
     assert.strictEqual(res2.dbName, 'perf_test');
     assert.deepStrictEqual(res2.hosts, ['localhost:27017']);
 
-    // IPv6 loopback [::1]
     const res3 = validateTestDatabaseUri('mongodb://[::1]:27017/perf_test');
     assert.strictEqual(res3.dbName, 'perf_test');
     assert.deepStrictEqual(res3.hosts, ['[::1]:27017']);
@@ -216,7 +213,6 @@ describe('T01.1 & T01.1.1 & T01.1.2 — Test Database Isolation & Host Guard Sui
   test('7. Remote hosts require explicit authorization via TEST_MONGO_ALLOWED_HOSTS', () => {
     const remoteUri = 'mongodb://test-cluster.internal:27017/kerala_perf_test';
 
-    // Fails when TEST_MONGO_ALLOWED_HOSTS is missing
     assert.throws(
       () => validateTestDatabaseUri(remoteUri, undefined),
       (err: unknown) => {
@@ -227,7 +223,6 @@ describe('T01.1 & T01.1.1 & T01.1.2 — Test Database Isolation & Host Guard Sui
       },
     );
 
-    // Fails when TEST_MONGO_ALLOWED_HOSTS does not contain this host
     assert.throws(
       () => validateTestDatabaseUri(remoteUri, 'other-cluster.internal,staging-db.local'),
       (err: unknown) => {
@@ -237,26 +232,25 @@ describe('T01.1 & T01.1.1 & T01.1.2 — Test Database Isolation & Host Guard Sui
       },
     );
 
-    // Succeeds when TEST_MONGO_ALLOWED_HOSTS explicitly includes the host
     const res = validateTestDatabaseUri(remoteUri, 'test-cluster.internal');
     assert.strictEqual(res.dbName, 'kerala_perf_test');
     assert.deepStrictEqual(res.hosts, ['test-cluster.internal:27017']);
+    assert.deepStrictEqual(res.allowedHosts, ['test-cluster.internal']);
   });
 
   test('8. Dedicated test-cluster with mongodb+srv is supported via allowlist', () => {
     const srvUri = 'mongodb+srv://cluster.internal.test/kerala_integration_test?retryWrites=true';
 
-    // Fails without allowlist
     assert.throws(
       () => validateTestDatabaseUri(srvUri),
       /Remote test host "cluster\.internal\.test" is not allowed/,
     );
 
-    // Succeeds with explicit allowlist
     const res = validateTestDatabaseUri(srvUri, 'cluster.internal.test');
     assert.strictEqual(res.protocol, 'mongodb+srv:');
     assert.strictEqual(res.dbName, 'kerala_integration_test');
     assert.deepStrictEqual(res.hosts, ['cluster.internal.test']);
+    assert.deepStrictEqual(res.allowedHosts, ['cluster.internal.test']);
   });
 
   test('9. Production-like hostnames are rejected even if present in allowlist', () => {
@@ -283,12 +277,10 @@ describe('T01.1 & T01.1.1 & T01.1.2 — Test Database Isolation & Host Guard Sui
   });
 
   test('10. Multi-host replica set validation validates every host', () => {
-    // Both hosts are local -> allowed
     const multiLocal = 'mongodb://127.0.0.1:27017,127.0.0.1:27018/replica_test';
     const res = validateTestDatabaseUri(multiLocal);
     assert.deepStrictEqual(res.hosts, ['127.0.0.1:27017', '127.0.0.1:27018']);
 
-    // One local and one unauthorized remote host -> rejected!
     const mixed = 'mongodb://127.0.0.1:27017,unapproved-node.internal:27017/replica_test';
     assert.throws(
       () => validateTestDatabaseUri(mixed),
@@ -310,7 +302,6 @@ describe('T01.1 & T01.1.1 & T01.1.2 — Test Database Isolation & Host Guard Sui
     const redactedSrv = redactMongoUri(srv);
     assert.strictEqual(redactedSrv, 'mongodb+srv://***:***@cluster0.mongodb.net/kerala_test');
 
-    // URI without auth is unchanged
     const plain = 'mongodb://localhost:27017/kerala_test';
     assert.strictEqual(redactMongoUri(plain), plain);
   });
@@ -420,6 +411,7 @@ describe('T01.1 & T01.1.1 & T01.1.2 — Test Database Isolation & Host Guard Sui
     dbName: 'kerala_perf_benchmark_test',
     hosts: ['127.0.0.1:27017'],
     protocol: 'mongodb:',
+    allowedHosts: [],
   };
 
   test('13. Host Mismatch 1: Database name matches, but connected host differs -> rejected and no dropDatabase', async () => {
@@ -453,9 +445,9 @@ describe('T01.1 & T01.1.1 & T01.1.2 — Test Database Isolation & Host Guard Sui
       dbName: 'kerala_perf_benchmark_test',
       hosts: ['test-cluster.internal:27017'],
       protocol: 'mongodb:',
+      allowedHosts: ['test-cluster.internal'],
     };
 
-    // Connection unexpectedly connected to a different or rogue server
     const rogueConn = createMockConnection({
       readyState: 1,
       name: 'kerala_perf_benchmark_test',
@@ -467,7 +459,7 @@ describe('T01.1 & T01.1.1 & T01.1.2 — Test Database Isolation & Host Guard Sui
     });
 
     await assert.rejects(
-      () => safeDropTestDatabase(rogueConn, authorizedRemoteDb, 'test-cluster.internal'),
+      () => safeDropTestDatabase(rogueConn, authorizedRemoteDb),
       (err: unknown) => {
         assert.ok(err instanceof TestDatabaseSafetyError);
         assert.match(err.message, /Connected host "rogue-server\.internal:27017" does not match any validated host/);
@@ -485,9 +477,9 @@ describe('T01.1 & T01.1.1 & T01.1.2 — Test Database Isolation & Host Guard Sui
       dbName: 'kerala_perf_benchmark_test',
       hosts: ['node1.test.local:27017', 'node2.test.local:27017'],
       protocol: 'mongodb:',
+      allowedHosts: ['node1.test.local', 'node2.test.local'],
     };
 
-    // Active connection topology discovered an unexpected node3
     const unexpectedReplicaConn = createMockConnection({
       readyState: 1,
       name: 'kerala_perf_benchmark_test',
@@ -498,7 +490,7 @@ describe('T01.1 & T01.1.1 & T01.1.2 — Test Database Isolation & Host Guard Sui
     });
 
     await assert.rejects(
-      () => safeDropTestDatabase(unexpectedReplicaConn, replicaSetDb, 'node1.test.local,node2.test.local'),
+      () => safeDropTestDatabase(unexpectedReplicaConn, replicaSetDb),
       (err: unknown) => {
         assert.ok(err instanceof TestDatabaseSafetyError);
         assert.match(err.message, /Connected host "node3\.unexpected\.local:27017" does not match/);
@@ -510,7 +502,6 @@ describe('T01.1 & T01.1.1 & T01.1.2 — Test Database Isolation & Host Guard Sui
 
   test('16. Host Mismatch 4: Actual host identity is missing or cannot be verified -> fail closed, no dropDatabase', async () => {
     let dropCalled = false;
-    // Connection missing host, port, and client topology
     const anonymousConn = createMockConnection({
       readyState: 1,
       name: 'kerala_perf_benchmark_test',
@@ -594,30 +585,7 @@ describe('T01.1 & T01.1.1 & T01.1.2 — Test Database Isolation & Host Guard Sui
     assert.strictEqual(dropCalled, true, 'dropDatabase MUST be called when all safety checks and host matches pass');
   });
 
-  test('20. SRV Cluster verification allows matching subdomain members', async () => {
-    let dropCalled = false;
-    const srvDb = {
-      uri: 'mongodb+srv://cluster.internal.test/kerala_perf_benchmark_test',
-      redactedUri: 'mongodb+srv://cluster.internal.test/kerala_perf_benchmark_test',
-      dbName: 'kerala_perf_benchmark_test',
-      hosts: ['cluster.internal.test'],
-      protocol: 'mongodb+srv:',
-    };
-
-    const srvConn = createMockConnection({
-      readyState: 1,
-      name: 'kerala_perf_benchmark_test',
-      servers: ['node1.cluster.internal.test:27017', 'node2.cluster.internal.test:27017'],
-      onDrop: () => {
-        dropCalled = true;
-      },
-    });
-
-    await safeDropTestDatabase(srvConn, srvDb, 'cluster.internal.test');
-    assert.strictEqual(dropCalled, true, 'dropDatabase should succeed for verified SRV cluster members');
-  });
-
-  test('21. Production keyword in connected host is rejected even if DB name passes', async () => {
+  test('20. Production keyword in connected host is rejected even if DB name passes', async () => {
     let dropCalled = false;
     const prodConnectedConn = createMockConnection({
       readyState: 1,
@@ -641,9 +609,181 @@ describe('T01.1 & T01.1.1 & T01.1.2 — Test Database Isolation & Host Guard Sui
   });
 
   // =========================================================================
-  // 7. Host Utility Helpers
+  // 7. T01.1.2-R1 SRV Allowlist Propagation & Strict Host Matching Tests
   // =========================================================================
-  test('22. Host helpers extractHostname, extractPort, extractActualConnectionHosts, and verifyConnectionHostIdentity', () => {
+  test('21. T01.1.2-R1: Remote SRV URI validated via resolveTestMongoUri succeeds during 2-argument safeDropTestDatabase', async () => {
+    let dropCalled = false;
+    const env = {
+      TEST_MONGO_URL: 'mongodb+srv://test_user:test_secret@cluster.internal.test/kerala_perf_test',
+      TEST_MONGO_ALLOWED_HOSTS: 'cluster.internal.test',
+    };
+
+    // 1. Resolve and validate SRV configuration
+    const validatedSrv = resolveTestMongoUri(env);
+    assert.strictEqual(validatedSrv.protocol, 'mongodb+srv:');
+    assert.deepStrictEqual(validatedSrv.allowedHosts, ['cluster.internal.test']);
+
+    // 2. Mock connection representing live SRV driver topology
+    const srvConn = createMockConnection({
+      readyState: 1,
+      name: 'kerala_perf_test',
+      servers: ['node1.cluster.internal.test:27017', 'node2.cluster.internal.test:27017'],
+      onDrop: () => {
+        dropCalled = true;
+      },
+    });
+
+    // 3. Exactly 2-argument call as executed in benchmark suite (without passing allowedHostsEnv explicitly)
+    await safeDropTestDatabase(srvConn, validatedSrv);
+    assert.strictEqual(dropCalled, true, 'safeDropTestDatabase MUST succeed using embedded allowedHosts');
+  });
+
+  test('22. T01.1.2-R1: Suffix domain attack (attacker-cluster.internal.test.evil.example) is strictly rejected', async () => {
+    let dropCalled = false;
+    const env = {
+      TEST_MONGO_URL: 'mongodb+srv://test_user:test_secret@cluster.internal.test/kerala_perf_test',
+      TEST_MONGO_ALLOWED_HOSTS: 'cluster.internal.test',
+    };
+    const validatedSrv = resolveTestMongoUri(env);
+
+    const suffixAttackConn = createMockConnection({
+      readyState: 1,
+      name: 'kerala_perf_test',
+      servers: ['attacker-cluster.internal.test.evil.example:27017'],
+      onDrop: () => {
+        dropCalled = true;
+      },
+    });
+
+    await assert.rejects(
+      () => safeDropTestDatabase(suffixAttackConn, validatedSrv),
+      (err: unknown) => {
+        assert.ok(err instanceof TestDatabaseSafetyError);
+        assert.match(err.message, /is not a valid member node of the authorized SRV domain/);
+        return true;
+      },
+    );
+    assert.strictEqual(dropCalled, false, 'dropDatabase must NEVER be called for suffix attack domain');
+  });
+
+  test('23. T01.1.2-R1: Pre-pended domain attack (evilcluster.internal.test) is strictly rejected', async () => {
+    let dropCalled = false;
+    const env = {
+      TEST_MONGO_URL: 'mongodb+srv://test_user:test_secret@cluster.internal.test/kerala_perf_test',
+      TEST_MONGO_ALLOWED_HOSTS: 'cluster.internal.test',
+    };
+    const validatedSrv = resolveTestMongoUri(env);
+
+    const evilPreConn = createMockConnection({
+      readyState: 1,
+      name: 'kerala_perf_test',
+      servers: ['evilcluster.internal.test:27017'],
+      onDrop: () => {
+        dropCalled = true;
+      },
+    });
+
+    await assert.rejects(
+      () => safeDropTestDatabase(evilPreConn, validatedSrv),
+      (err: unknown) => {
+        assert.ok(err instanceof TestDatabaseSafetyError);
+        assert.match(err.message, /is not a valid member node of the authorized SRV domain/);
+        return true;
+      },
+    );
+    assert.strictEqual(dropCalled, false, 'dropDatabase must NEVER be called for evil-prefixed domain');
+  });
+
+  test('24. T01.1.2-R1: Unauthorized SRV member from a completely different domain is rejected', async () => {
+    let dropCalled = false;
+    const env = {
+      TEST_MONGO_URL: 'mongodb+srv://test_user:test_secret@cluster.internal.test/kerala_perf_test',
+      TEST_MONGO_ALLOWED_HOSTS: 'cluster.internal.test',
+    };
+    const validatedSrv = resolveTestMongoUri(env);
+
+    const unauthMemberConn = createMockConnection({
+      readyState: 1,
+      name: 'kerala_perf_test',
+      servers: ['node1.cluster.internal.test:27017', 'rogue-node.other-cluster.test:27017'],
+      onDrop: () => {
+        dropCalled = true;
+      },
+    });
+
+    await assert.rejects(
+      () => safeDropTestDatabase(unauthMemberConn, validatedSrv),
+      (err: unknown) => {
+        assert.ok(err instanceof TestDatabaseSafetyError);
+        assert.match(err.message, /is not a valid member node of the authorized SRV domain/);
+        return true;
+      },
+    );
+    assert.strictEqual(dropCalled, false, 'dropDatabase must NEVER be called if any member node is unauthorized');
+  });
+
+  test('25. T01.1.2-R1: Production-like SRV member node is rejected even within valid domain', async () => {
+    let dropCalled = false;
+    const env = {
+      TEST_MONGO_URL: 'mongodb+srv://test_user:test_secret@cluster.internal.test/kerala_perf_test',
+      TEST_MONGO_ALLOWED_HOSTS: 'cluster.internal.test',
+    };
+    const validatedSrv = resolveTestMongoUri(env);
+
+    const prodMemberConn = createMockConnection({
+      readyState: 1,
+      name: 'kerala_perf_test',
+      servers: ['prod-node1.cluster.internal.test:27017'],
+      onDrop: () => {
+        dropCalled = true;
+      },
+    });
+
+    await assert.rejects(
+      () => safeDropTestDatabase(prodMemberConn, validatedSrv),
+      (err: unknown) => {
+        assert.ok(err instanceof TestDatabaseSafetyError);
+        assert.match(err.message, /contains forbidden production keyword/);
+        return true;
+      },
+    );
+    assert.strictEqual(dropCalled, false, 'dropDatabase must NEVER be called on production-keyword member');
+  });
+
+  test('26. T01.1.2-R1: Non-SRV (mongodb://) connections enforce exact match and disallow arbitrary subdomains', async () => {
+    let dropCalled = false;
+    const env = {
+      TEST_MONGO_URL: 'mongodb://standalone-test.internal:27017/kerala_perf_test',
+      TEST_MONGO_ALLOWED_HOSTS: 'standalone-test.internal',
+    };
+    const nonSrvDb = resolveTestMongoUri(env);
+
+    // Connected host is a subdomain, but the URI was standard mongodb://, not mongodb+srv://
+    const subdomainConn = createMockConnection({
+      readyState: 1,
+      name: 'kerala_perf_test',
+      host: 'subdomain.standalone-test.internal',
+      port: 27017,
+      onDrop: () => {
+        dropCalled = true;
+      },
+    });
+
+    await assert.rejects(
+      () => safeDropTestDatabase(subdomainConn, nonSrvDb),
+      (err: unknown) => {
+        assert.ok(err instanceof TestDatabaseSafetyError);
+        assert.match(err.message, /does not match any validated host/);
+        return true;
+      },
+    );
+    assert.strictEqual(dropCalled, false, 'dropDatabase must reject subdomains on standard mongodb:// connections');
+  });
+
+  // =========================================================================
+  // 8. Host Utility Helpers
+  // =========================================================================
+  test('27. Host helpers extractHostname, extractPort, extractActualConnectionHosts, and verifyConnectionHostIdentity', () => {
     assert.strictEqual(extractHostname('localhost:27017'), 'localhost');
     assert.strictEqual(extractHostname('127.0.0.1'), '127.0.0.1');
     assert.strictEqual(extractHostname('[::1]:27017'), '::1');

@@ -6,6 +6,7 @@ export interface ValidatedTestDatabase {
   dbName: string;
   hosts: string[];
   protocol: string;
+  allowedHosts: string[];
 }
 
 export class TestDatabaseSafetyError extends Error {
@@ -88,6 +89,25 @@ export function extractPort(hostString: string, defaultPort = 27017): number {
   return defaultPort;
 }
 
+/**
+ * Parses and normalizes an allowed hosts configuration string into an array of lowercase hostnames/hosts.
+ */
+export function parseAllowedHosts(rawAllowedHostsEnv?: string): string[] {
+  if (!rawAllowedHostsEnv || !rawAllowedHostsEnv.trim()) {
+    return [];
+  }
+  const hostSet = new Set<string>();
+  const items = rawAllowedHostsEnv
+    .split(/[,\s]+/)
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean);
+  for (const item of items) {
+    hostSet.add(item);
+    hostSet.add(extractHostname(item));
+  }
+  return Array.from(hostSet);
+}
+
 interface ParsedMongoUriParts {
   protocol: string;
   hosts: string[];
@@ -167,24 +187,18 @@ function parseMongoUriParts(trimmedUri: string): ParsedMongoUriParts {
 /**
  * Validates hosts against the host-isolation policy.
  * Local loopback instances are approved by default.
- * Remote clusters strictly require explicit approval via TEST_MONGO_ALLOWED_HOSTS.
+ * Remote clusters strictly require explicit exact approval via TEST_MONGO_ALLOWED_HOSTS.
  * Production-like hostnames are unconditionally rejected.
  */
 export function validateHostPolicy(
   hosts: string[],
-  rawAllowedHostsEnv?: string,
+  allowedRemoteHostsInput?: string | string[],
 ): void {
-  const allowedRemoteHosts = new Set<string>();
-  if (rawAllowedHostsEnv && rawAllowedHostsEnv.trim()) {
-    const items = rawAllowedHostsEnv
-      .split(/[,\s]+/)
-      .map((item) => item.trim().toLowerCase())
-      .filter(Boolean);
-    for (const item of items) {
-      allowedRemoteHosts.add(item);
-      allowedRemoteHosts.add(extractHostname(item));
-    }
-  }
+  const allowedRemoteHosts = new Set<string>(
+    Array.isArray(allowedRemoteHostsInput)
+      ? allowedRemoteHostsInput
+      : parseAllowedHosts(allowedRemoteHostsInput),
+  );
 
   for (const rawHost of hosts) {
     const hostname = extractHostname(rawHost);
@@ -204,18 +218,9 @@ export function validateHostPolicy(
       continue;
     }
 
-    // 3. For remote hosts, enforce match in TEST_MONGO_ALLOWED_HOSTS (exact match or cluster domain member)
-    let isApprovedRemote =
+    // 3. For remote hosts, enforce exact match in allowedRemoteHosts (no wildcarding)
+    const isApprovedRemote =
       allowedRemoteHosts.has(hostLower) || allowedRemoteHosts.has(hostname);
-
-    if (!isApprovedRemote) {
-      for (const allowed of allowedRemoteHosts) {
-        if (hostname.endsWith(`.${allowed}`)) {
-          isApprovedRemote = true;
-          break;
-        }
-      }
-    }
 
     if (!isApprovedRemote) {
       if (allowedRemoteHosts.size === 0) {
@@ -234,6 +239,7 @@ export function validateHostPolicy(
 /**
  * Validates that a MongoDB URI points strictly to an isolated test database.
  * Enforces host-isolation policy and database naming convention.
+ * Embeds authorized host policy inside the returned ValidatedTestDatabase.
  * Never leaks credentials in thrown safety errors.
  */
 export function validateTestDatabaseUri(
@@ -251,8 +257,11 @@ export function validateTestDatabaseUri(
 
   const { protocol, hosts, dbName } = parseMongoUriParts(trimmedUri);
 
+  // Parse and normalize allowed remote hosts
+  const parsedAllowed = parseAllowedHosts(allowedHostsEnv);
+
   // Validate Host Isolation Policy
-  validateHostPolicy(hosts, allowedHostsEnv);
+  validateHostPolicy(hosts, parsedAllowed);
 
   const lowerName = dbName.toLowerCase();
 
@@ -285,6 +294,7 @@ export function validateTestDatabaseUri(
     dbName,
     hosts,
     protocol,
+    allowedHosts: parsedAllowed,
   };
 }
 
@@ -367,19 +377,27 @@ export function extractActualConnectionHosts(connection: mongoose.Connection): s
 
 /**
  * Verifies that the actual connected MongoDB deployment host(s) strictly match
- * the validated test database configuration.
+ * the validated test database configuration and authorization policy.
  * Fails closed if host identity cannot be established or if any actual host is unauthorized.
  */
 export function verifyConnectionHostIdentity(
   actualHosts: string[],
   expected: ValidatedTestDatabase,
-  allowedHostsEnv?: string,
+  effectiveAllowedHostsInput?: string | string[],
 ): void {
   if (!actualHosts || actualHosts.length === 0) {
     throw new TestDatabaseSafetyError(
       'Cannot drop database: unable to establish connection host identity reliably. No host information exposed on connection.',
     );
   }
+
+  const allowedSet = new Set<string>(
+    Array.isArray(effectiveAllowedHostsInput)
+      ? effectiveAllowedHostsInput
+      : effectiveAllowedHostsInput
+        ? parseAllowedHosts(effectiveAllowedHostsInput)
+        : expected.allowedHosts,
+  );
 
   const isSrv = expected.protocol === 'mongodb+srv:';
   const expectedSrvDomain = isSrv && expected.hosts[0] ? extractHostname(expected.hosts[0]) : null;
@@ -397,16 +415,33 @@ export function verifyConnectionHostIdentity(
       }
     }
 
-    // 2. Check if actualHost matches the expected configuration
-    let matchesExpected = false;
-
+    // 2. Check if actualHost matches the expected deployment
     if (isSrv && expectedSrvDomain) {
-      // For SRV, the node must either equal the SRV domain or be a subdomain of the SRV domain
-      if (actualHostname === expectedSrvDomain || actualHostname.endsWith(`.${expectedSrvDomain}`)) {
-        matchesExpected = true;
+      // For SRV, the node must either equal the SRV domain or be a genuine subdomain member of the SRV domain
+      const isSrvNode =
+        actualHostname === expectedSrvDomain ||
+        actualHostname.endsWith(`.${expectedSrvDomain}`);
+
+      if (!isSrvNode) {
+        throw new TestDatabaseSafetyError(
+          `Connected host "${actualHost}" is not a valid member node of the authorized SRV domain "${expectedSrvDomain}". Destructive cleanup aborted.`,
+        );
+      }
+
+      // SRV domain must be authorized in allowedSet (or be local loopback)
+      const isAuthorized =
+        APPROVED_LOCAL_HOSTS.has(actualHostname) ||
+        allowedSet.has(expectedSrvDomain) ||
+        allowedSet.has(actualHostname);
+
+      if (!isAuthorized) {
+        throw new TestDatabaseSafetyError(
+          `Connected host "${actualHost}" belongs to SRV domain "${expectedSrvDomain}" which is not authorized in allowed hosts: [${[...allowedSet].join(', ')}]. Destructive cleanup aborted.`,
+        );
       }
     } else {
-      // For standard mongodb:// connections, check against expected.hosts
+      // For standard mongodb:// connections, check against expected.hosts (exact match)
+      let matchesExpected = false;
       for (const expHost of expected.hosts) {
         const expHostname = extractHostname(expHost);
         const expPort = extractPort(expHost);
@@ -416,16 +451,25 @@ export function verifyConnectionHostIdentity(
           break;
         }
       }
-    }
 
-    if (!matchesExpected) {
-      throw new TestDatabaseSafetyError(
-        `Connected host "${actualHost}" does not match any validated host in expected test configuration: [${expected.hosts.join(', ')}]. Destructive cleanup aborted.`,
-      );
-    }
+      if (!matchesExpected) {
+        throw new TestDatabaseSafetyError(
+          `Connected host "${actualHost}" does not match any validated host in expected test configuration: [${expected.hosts.join(', ')}]. Destructive cleanup aborted.`,
+        );
+      }
 
-    // 3. Confirm actual host passes host isolation policy
-    validateHostPolicy([actualHost], allowedHostsEnv);
+      // Standard host must be authorized in allowedSet (or be local loopback)
+      const isAuthorized =
+        APPROVED_LOCAL_HOSTS.has(actualHostname) ||
+        allowedSet.has(actualHostname) ||
+        allowedSet.has(actualHost.toLowerCase());
+
+      if (!isAuthorized) {
+        throw new TestDatabaseSafetyError(
+          `Connected host "${actualHost}" is not authorized in allowed hosts: [${[...allowedSet].join(', ')}]. Destructive cleanup aborted.`,
+        );
+      }
+    }
   }
 }
 
@@ -436,7 +480,7 @@ export function verifyConnectionHostIdentity(
 export async function safeDropTestDatabase(
   connection: mongoose.Connection,
   expected: ValidatedTestDatabase,
-  allowedHostsEnv?: string,
+  allowedHostsOverride?: string,
 ): Promise<void> {
   if (connection.readyState !== 1) {
     throw new TestDatabaseSafetyError(
@@ -471,9 +515,14 @@ export async function safeDropTestDatabase(
     }
   }
 
+  // Determine effective allowed hosts: uses expected.allowedHosts unless explicitly overridden
+  const effectiveAllowedHosts = allowedHostsOverride
+    ? parseAllowedHosts(allowedHostsOverride)
+    : expected.allowedHosts;
+
   // Verify actual connection host identity against validated configuration
   const actualHosts = extractActualConnectionHosts(connection);
-  verifyConnectionHostIdentity(actualHosts, expected, allowedHostsEnv);
+  verifyConnectionHostIdentity(actualHosts, expected, effectiveAllowedHosts);
 
   await connection.dropDatabase();
 }
