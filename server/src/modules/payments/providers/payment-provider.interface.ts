@@ -44,5 +44,5 @@ export interface IPaymentProvider {
   createOrder(input: CreateProviderOrderInput): Promise<ProviderOrderResult>;
   verifyPaymentSignature(input: VerifyProviderPaymentSignatureInput): boolean;
   verifyWebhookSignature(input: VerifyWebhookSignatureInput): boolean;
-  fetchPayment(providerPaymentId: string): Promise<ProviderPaymentResult>;
+  fetchPayment(providerPaymentId: string, expectedOrderId?: string): Promise<ProviderPaymentResult>;
 }

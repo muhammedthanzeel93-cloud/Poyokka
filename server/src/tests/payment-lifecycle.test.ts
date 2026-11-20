@@ -653,6 +653,117 @@ describe('DAY 24 — Payment Integration, Payment Lifecycle & Webhook Security',
     assert.strictEqual(booking.paymentId?.toString(), paymentId);
   });
 
+  it('14a. Rejects payment verification when gateway reports payment is authorized but not captured', async () => {
+    const initRes = await dispatchRequest(app, 'POST', `/api/v1/tourist/bookings/${bookingId}/payments`, {
+      token: touristToken,
+    });
+    const paymentId = initRes.body.data.payment.id;
+    const orderId = initRes.body.data.checkoutData.orderId;
+    const paymentProviderId = 'pay_test_auth_only_01';
+
+    // Mock gateway payment to report 'authorized' instead of 'captured'
+    testProvider.setSimulatedPayment(paymentProviderId, {
+      providerPaymentId: paymentProviderId,
+      providerOrderId: orderId,
+      amountPaise: 1500000,
+      currency: 'INR',
+      status: 'authorized',
+      method: 'card',
+    });
+
+    const validSignature = crypto
+      .createHmac('sha256', testKeySecret)
+      .update(`${orderId}|${paymentProviderId}`)
+      .digest('hex');
+
+    const res = await dispatchRequest(app, 'POST', '/api/v1/tourist/payments/verify', {
+      token: touristToken,
+      body: {
+        paymentId,
+        razorpay_order_id: orderId,
+        razorpay_payment_id: paymentProviderId,
+        razorpay_signature: validSignature,
+      },
+    });
+
+    assert.strictEqual(res.status, 400);
+    assert.match(res.body.message, /not captured/i);
+  });
+
+  it('14b. Rejects payment verification when gateway reports amount mismatch', async () => {
+    const initRes = await dispatchRequest(app, 'POST', `/api/v1/tourist/bookings/${bookingId}/payments`, {
+      token: touristToken,
+    });
+    const paymentId = initRes.body.data.payment.id;
+    const orderId = initRes.body.data.checkoutData.orderId;
+    const paymentProviderId = 'pay_test_amount_mismatch_01';
+
+    // Mock gateway payment to report tampered amount (1000 INR instead of 15000 INR)
+    testProvider.setSimulatedPayment(paymentProviderId, {
+      providerPaymentId: paymentProviderId,
+      providerOrderId: orderId,
+      amountPaise: 100000,
+      currency: 'INR',
+      status: 'captured',
+      method: 'upi',
+    });
+
+    const validSignature = crypto
+      .createHmac('sha256', testKeySecret)
+      .update(`${orderId}|${paymentProviderId}`)
+      .digest('hex');
+
+    const res = await dispatchRequest(app, 'POST', '/api/v1/tourist/payments/verify', {
+      token: touristToken,
+      body: {
+        paymentId,
+        razorpay_order_id: orderId,
+        razorpay_payment_id: paymentProviderId,
+        razorpay_signature: validSignature,
+      },
+    });
+
+    assert.strictEqual(res.status, 400);
+    assert.match(res.body.message, /amount mismatch/i);
+  });
+
+  it('14c. Rejects payment verification when gateway reports currency mismatch', async () => {
+    const initRes = await dispatchRequest(app, 'POST', `/api/v1/tourist/bookings/${bookingId}/payments`, {
+      token: touristToken,
+    });
+    const paymentId = initRes.body.data.payment.id;
+    const orderId = initRes.body.data.checkoutData.orderId;
+    const paymentProviderId = 'pay_test_currency_mismatch_01';
+
+    // Mock gateway payment to report USD instead of INR
+    testProvider.setSimulatedPayment(paymentProviderId, {
+      providerPaymentId: paymentProviderId,
+      providerOrderId: orderId,
+      amountPaise: 1500000,
+      currency: 'USD',
+      status: 'captured',
+      method: 'card',
+    });
+
+    const validSignature = crypto
+      .createHmac('sha256', testKeySecret)
+      .update(`${orderId}|${paymentProviderId}`)
+      .digest('hex');
+
+    const res = await dispatchRequest(app, 'POST', '/api/v1/tourist/payments/verify', {
+      token: touristToken,
+      body: {
+        paymentId,
+        razorpay_order_id: orderId,
+        razorpay_payment_id: paymentProviderId,
+        razorpay_signature: validSignature,
+      },
+    });
+
+    assert.strictEqual(res.status, 400);
+    assert.match(res.body.message, /currency mismatch/i);
+  });
+
   it('15. Repeated payment verification is idempotent and does not double-confirm', async () => {
     const initRes = await dispatchRequest(app, 'POST', `/api/v1/tourist/bookings/${bookingId}/payments`, {
       token: touristToken,
@@ -813,6 +924,52 @@ describe('DAY 24 — Payment Integration, Payment Lifecycle & Webhook Security',
 
     const hold = testBookingsRepo.inMemoryHolds.get(holdId.toString())!;
     assert.strictEqual(hold.status, INVENTORY_HOLD_STATUSES.CONSUMED);
+  });
+
+  it('19a. Rejects payment.captured webhook when amount in webhook payload differs from booking price snapshot', async () => {
+    const initRes = await dispatchRequest(app, 'POST', `/api/v1/tourist/bookings/${bookingId}/payments`, {
+      token: touristToken,
+    });
+    const orderId = initRes.body.data.checkoutData.orderId;
+    const providerPaymentId = 'pay_webhook_tampered_amt_01';
+
+    const webhookBody = {
+      event: 'payment.captured',
+      payload: {
+        payment: {
+          entity: {
+            id: providerPaymentId,
+            order_id: orderId,
+            amount: 50000, // 500 INR instead of 15000 INR
+            currency: 'INR',
+            status: 'captured',
+            created_at: Math.floor(Date.now() / 1000),
+          },
+        },
+      },
+    };
+
+    const rawStr = JSON.stringify(webhookBody);
+    const validWebhookSig = crypto
+      .createHmac('sha256', testWebhookSecret)
+      .update(rawStr)
+      .digest('hex');
+
+    const res = await dispatchRequest(app, 'POST', '/api/v1/webhooks/razorpay', {
+      headers: {
+        'x-razorpay-signature': validWebhookSig,
+        'x-razorpay-event-id': 'evt_test_tampered_amt_01',
+        'content-type': 'application/json',
+      },
+      body: webhookBody,
+    });
+
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(res.body.data.status, 'AMOUNT_MISMATCH');
+
+    // Confirm booking was NOT confirmed with tampered amount
+    const booking = testBookingsRepo.inMemoryBookings.get(bookingId.toString())!;
+    assert.notStrictEqual(booking.status, BOOKING_STATUSES.CONFIRMED);
   });
 
   it('20. Deduplicates repeated webhook event with identical event ID', async () => {

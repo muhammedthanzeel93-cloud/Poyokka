@@ -349,7 +349,69 @@ export class PaymentsService {
       throw new BadRequestError('Invalid payment signature', 'INVALID_PAYMENT_SIGNATURE');
     }
 
-    // 4. Execute Atomic Confirmation & Hold Consumption in MongoDB Transaction
+    // 4. Fetch Authoritative Payment Details from Provider Gateway & Verify Capture Status
+    const gatewayPayment = await this.provider.fetchPayment(
+      input.razorpay_payment_id,
+      payment.providerOrderId || input.razorpay_order_id,
+    );
+
+    // Verify gateway payment status is CAPTURED
+    if (gatewayPayment.status !== 'captured') {
+      const isFailed = gatewayPayment.status === 'failed';
+      await this.repo.updatePayment(payment._id, {
+        status: isFailed ? PAYMENT_STATUSES.FAILED : PAYMENT_STATUSES.PENDING,
+        failureCode: gatewayPayment.errorCode || 'PAYMENT_NOT_CAPTURED',
+        failureDescription:
+          gatewayPayment.errorDescription || `Payment is in ${gatewayPayment.status} status at gateway`,
+      });
+
+      await this.auditService.recordAdminAction({
+        actorAccountId: touristAccountId,
+        actorAccountType: 'TOURIST',
+        action: ADMIN_AUDIT_ACTIONS.PAYMENT_FAILED,
+        targetEntityId: payment._id,
+        targetEntityType: AUDIT_TARGET_ENTITY_TYPES.PAYMENT,
+        reason: `Payment verification rejected: gateway status is ${gatewayPayment.status}`,
+        beforeState: { status: payment.status },
+        afterState: { status: isFailed ? PAYMENT_STATUSES.FAILED : PAYMENT_STATUSES.PENDING },
+      });
+
+      throw new BadRequestError(
+        `Payment was not captured by gateway (current status: ${gatewayPayment.status})`,
+        'PAYMENT_NOT_CAPTURED',
+      );
+    }
+
+    // Verify order ID match between gateway and internal payment
+    if (
+      gatewayPayment.providerOrderId &&
+      payment.providerOrderId &&
+      gatewayPayment.providerOrderId !== payment.providerOrderId
+    ) {
+      throw new BadRequestError('Payment provider order ID mismatch', 'ORDER_ID_MISMATCH');
+    }
+
+    // Verify captured amount matches expected order price snapshot
+    if (gatewayPayment.amountPaise !== payment.amountPaise) {
+      throw new BadRequestError(
+        `Payment amount mismatch: expected ${payment.amountPaise} paise, but gateway reported ${gatewayPayment.amountPaise} paise`,
+        'PAYMENT_AMOUNT_MISMATCH',
+      );
+    }
+
+    // Verify currency match
+    if (
+      gatewayPayment.currency &&
+      payment.currency &&
+      gatewayPayment.currency.toUpperCase() !== payment.currency.toUpperCase()
+    ) {
+      throw new BadRequestError(
+        `Payment currency mismatch: expected ${payment.currency}, but gateway reported ${gatewayPayment.currency}`,
+        'PAYMENT_CURRENCY_MISMATCH',
+      );
+    }
+
+    // 5. Execute Atomic Confirmation & Hold Consumption in MongoDB Transaction
     const result = await this.repo.withTransaction(async (session) => {
       return await this.repo.confirmBookingAndConsumeHold(
         {

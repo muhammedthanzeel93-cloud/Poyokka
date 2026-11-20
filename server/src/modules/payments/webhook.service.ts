@@ -154,6 +154,39 @@ export class WebhookService {
     // Process specific events
     try {
       if (event === 'payment.captured') {
+        // Validate amount and currency match internal order snapshot
+        if (paymentEntity?.amount !== undefined && paymentEntity.amount !== payment.amountPaise) {
+          await this.repo.updateWebhookEventStatus(
+            webhookEventRecord._id,
+            PAYMENT_WEBHOOK_STATUSES.FAILED,
+            'PAYMENT_AMOUNT_MISMATCH',
+          );
+          return {
+            received: true,
+            event,
+            eventId: providerEventId,
+            status: 'AMOUNT_MISMATCH',
+          };
+        }
+
+        if (
+          paymentEntity?.currency &&
+          payment.currency &&
+          paymentEntity.currency.toUpperCase() !== payment.currency.toUpperCase()
+        ) {
+          await this.repo.updateWebhookEventStatus(
+            webhookEventRecord._id,
+            PAYMENT_WEBHOOK_STATUSES.FAILED,
+            'PAYMENT_CURRENCY_MISMATCH',
+          );
+          return {
+            received: true,
+            event,
+            eventId: providerEventId,
+            status: 'CURRENCY_MISMATCH',
+          };
+        }
+
         const result = await this.repo.withTransaction(async (session) => {
           return await this.repo.confirmBookingAndConsumeHold(
             {

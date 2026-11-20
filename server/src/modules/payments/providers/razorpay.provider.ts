@@ -12,6 +12,11 @@ import {
 
 export class RazorpayPaymentProvider implements IPaymentProvider {
   public readonly providerName = PAYMENT_PROVIDERS.RAZORPAY;
+  private readonly simulatedOrders: Map<
+    string,
+    { orderId: string; amountPaise: number; currency: string; receipt: string; notes?: Record<string, string> }
+  > = new Map();
+  private readonly simulatedPayments: Map<string, ProviderPaymentResult> = new Map();
 
   constructor(
     private readonly keyId: string,
@@ -24,6 +29,13 @@ export class RazorpayPaymentProvider implements IPaymentProvider {
     // If running in sandbox simulation mode (strictly prohibited in production)
     if (this.isSimulated) {
       const orderId = `order_${crypto.randomBytes(8).toString('hex')}`;
+      this.simulatedOrders.set(orderId, {
+        orderId,
+        amountPaise: input.amountPaise,
+        currency: input.currency || 'INR',
+        receipt: input.receipt,
+        notes: input.notes,
+      });
       return {
         orderId,
         amountPaise: input.amountPaise,
@@ -144,13 +156,45 @@ export class RazorpayPaymentProvider implements IPaymentProvider {
     }
   }
 
-  public async fetchPayment(providerPaymentId: string): Promise<ProviderPaymentResult> {
+  public async fetchPayment(
+    providerPaymentId: string,
+    expectedOrderId?: string,
+  ): Promise<ProviderPaymentResult> {
     if (this.isSimulated) {
+      // 1. Explicit mock override for testing
+      const explicit = this.simulatedPayments.get(providerPaymentId);
+      if (explicit) {
+        return explicit;
+      }
+
+      // 2. Simulated failure convention
+      if (providerPaymentId.startsWith('pay_fail_')) {
+        return {
+          providerPaymentId,
+          providerOrderId: expectedOrderId || 'order_simulated_fail',
+          amountPaise: 0,
+          currency: 'INR',
+          status: 'failed',
+          errorCode: 'BAD_REQUEST_ERROR',
+          errorDescription: 'Simulated gateway payment failure',
+        };
+      }
+
+      // 3. Find simulated order by expectedOrderId or take the latest created order
+      let order = expectedOrderId ? this.simulatedOrders.get(expectedOrderId) : undefined;
+      if (!order && this.simulatedOrders.size > 0) {
+        order = Array.from(this.simulatedOrders.values()).pop();
+      }
+
+      const amountPaise = order ? order.amountPaise : 500000;
+      const currency = order ? order.currency : 'INR';
+      const orderId = order ? order.orderId : (expectedOrderId || `order_${crypto.randomBytes(8).toString('hex')}`);
+
       return {
         providerPaymentId,
-        providerOrderId: `order_${crypto.randomBytes(8).toString('hex')}`,
-        amountPaise: 500000,
-        currency: 'INR',
+        providerOrderId: orderId,
+        amountPaise,
+        currency,
         status: 'captured',
         method: 'upi',
       };
@@ -196,5 +240,14 @@ export class RazorpayPaymentProvider implements IPaymentProvider {
         'PAYMENT_GATEWAY_NETWORK_ERROR',
       );
     }
+  }
+
+  public setSimulatedPayment(paymentId: string, result: ProviderPaymentResult): void {
+    this.simulatedPayments.set(paymentId, result);
+  }
+
+  public clearSimulatedData(): void {
+    this.simulatedOrders.clear();
+    this.simulatedPayments.clear();
   }
 }
