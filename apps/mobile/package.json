@@ -11,7 +11,7 @@
     "web": "expo start --web",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src --ext .ts,.tsx",
-    "test": "tsx --test \"src/tests/*.test.ts\" \"src/tests/**/*.test.ts\""
+    "test": "node --import tsx --test src/tests/mobile-auth.test.ts src/tests/mobile-booking.test.ts src/tests/mobile-e2e-journey.test.ts src/tests/mobile-notifications.test.ts src/tests/mobile-payment.test.ts src/tests/mobile-ui.test.ts"
   },
   "dependencies": {
     "@kerala-tourism/api-client": "*",
