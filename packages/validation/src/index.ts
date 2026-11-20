@@ -41,6 +41,7 @@ import {
   VERIFICATION_STATUSES,
   DEVICE_PLATFORMS,
   NOTIFICATION_RULES,
+  PAYMENT_RULES,
 } from '@kerala-tourism/constants';
 
 // Environment Variables Schema
@@ -2261,12 +2262,32 @@ export type PaymentIdParamInput = z.infer<typeof paymentIdParamSchema>;
 export const paymentQueryFilterSchema = z
   .object({
     status: z.string().trim().optional(),
+    reconciliationStatus: z.string().trim().optional(),
     page: z.coerce.number().int().positive().default(1),
     limit: z.coerce.number().int().positive().max(50).default(20),
   })
   .strict({ message: 'Unrecognized query parameters' });
 
 export type PaymentQueryFilterInput = z.infer<typeof paymentQueryFilterSchema>;
+
+export const refundPaymentSchema = z
+  .object({
+    amountPaise: z
+      .number({ invalid_type_error: 'Refund amount must be a number' })
+      .int('Refund amount must be an integer')
+      .positive('Refund amount must be positive')
+      .max(PAYMENT_RULES.MAX_AMOUNT_PAISE, 'Refund amount exceeds maximum permitted limit')
+      .optional(),
+    reason: z
+      .string()
+      .trim()
+      .min(3, 'Refund reason must be at least 3 characters')
+      .max(500, 'Refund reason cannot exceed 500 characters')
+      .optional(),
+  })
+  .strict({ message: 'Unrecognized fields in refund request' });
+
+export type RefundPaymentInput = z.infer<typeof refundPaymentSchema>;
 
 // ============================================================================
 // NOTIFICATION & DEVICE SCHEMAS (DAY 26)

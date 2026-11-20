@@ -267,8 +267,9 @@ export class PaymentsRepository {
   }
 
   public async listPayments(filter: {
-    touristAccountId: string | Types.ObjectId;
+    touristAccountId?: string | Types.ObjectId;
     status?: PaymentStatus;
+    reconciliationStatus?: string;
     page?: number;
     limit?: number;
   }): Promise<{ items: IPaymentLean[]; total: number }> {
@@ -277,10 +278,10 @@ export class PaymentsRepository {
     const skip = (page - 1) * limit;
 
     if (mongoose.connection.readyState === 0) {
-      const accountIdStr = filter.touristAccountId.toString();
       const all = Array.from(this.inMemoryPayments.values()).filter((p) => {
-        if (p.touristAccountId.toString() !== accountIdStr) return false;
+        if (filter.touristAccountId && p.touristAccountId.toString() !== filter.touristAccountId.toString()) return false;
         if (filter.status && p.status !== filter.status) return false;
+        if (filter.reconciliationStatus && p.reconciliationStatus !== filter.reconciliationStatus) return false;
         return true;
       });
       all.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
@@ -290,11 +291,15 @@ export class PaymentsRepository {
       };
     }
 
-    const query: FilterQuery<IPaymentDocument> = {
-      touristAccountId: filter.touristAccountId,
-    };
+    const query: FilterQuery<IPaymentDocument> = {};
+    if (filter.touristAccountId) {
+      query.touristAccountId = filter.touristAccountId;
+    }
     if (filter.status) {
       query.status = filter.status;
+    }
+    if (filter.reconciliationStatus) {
+      query.reconciliationStatus = filter.reconciliationStatus;
     }
 
     const [items, total] = await Promise.all([

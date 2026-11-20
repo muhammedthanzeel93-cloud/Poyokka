@@ -1,16 +1,23 @@
 import { Router } from 'express';
-import { ACCOUNT_TYPES } from '@kerala-tourism/constants';
+import { ACCOUNT_TYPES, ADMIN_PERMISSIONS } from '@kerala-tourism/constants';
 import {
   bookingIdParamSchema,
   verifyPaymentSignatureSchema,
   paymentIdParamSchema,
+  refundPaymentSchema,
+  paymentQueryFilterSchema,
 } from '@kerala-tourism/validation';
 import { authenticate } from '../../middlewares/auth.middleware';
-import { requireAccountType } from '../../middlewares/authorization.middleware';
-import { validateBody, validateParams } from '../../middlewares/validateRequest';
+import {
+  requireAccountType,
+  requireActiveAccount,
+  requireAnyPermission,
+} from '../../middlewares/authorization.middleware';
+import { validateBody, validateParams, validateQuery } from '../../middlewares/validateRequest';
 import {
   paymentInitiationRateLimiter,
   paymentVerificationRateLimiter,
+  adminMutationRateLimiter,
 } from '../../middlewares/rateLimiter';
 import { paymentsController } from './payments.controller';
 
@@ -60,6 +67,54 @@ touristBookingPaymentRoutes.get(
   requireAccountType(ACCOUNT_TYPES.TOURIST),
   validateParams(bookingIdParamSchema),
   paymentsController.getPaymentByBookingId,
+);
+
+// -----------------------------------------------------------------------------
+// ADMIN PAYMENT & RECONCILIATION ROUTES (Mounted under /api/v1/admin/payments)
+// -----------------------------------------------------------------------------
+export const adminPaymentRoutes = Router();
+
+// POST /api/v1/admin/payments/:paymentId/refund
+adminPaymentRoutes.post(
+  '/:paymentId/refund',
+  authenticate,
+  requireActiveAccount,
+  requireAccountType(ACCOUNT_TYPES.ADMIN),
+  requireAnyPermission([ADMIN_PERMISSIONS.MANAGE_BOOKINGS, ADMIN_PERMISSIONS.HANDLE_DISPUTES]),
+  adminMutationRateLimiter,
+  validateParams(paymentIdParamSchema),
+  validateBody(refundPaymentSchema),
+  paymentsController.refundPayment,
+);
+
+// GET /api/v1/admin/payments/:paymentId
+adminPaymentRoutes.get(
+  '/:paymentId',
+  authenticate,
+  requireActiveAccount,
+  requireAccountType(ACCOUNT_TYPES.ADMIN),
+  requireAnyPermission([
+    ADMIN_PERMISSIONS.MANAGE_BOOKINGS,
+    ADMIN_PERMISSIONS.HANDLE_DISPUTES,
+    ADMIN_PERMISSIONS.VIEW_DASHBOARD,
+  ]),
+  validateParams(paymentIdParamSchema),
+  paymentsController.getAdminPaymentById,
+);
+
+// GET /api/v1/admin/payments
+adminPaymentRoutes.get(
+  '/',
+  authenticate,
+  requireActiveAccount,
+  requireAccountType(ACCOUNT_TYPES.ADMIN),
+  requireAnyPermission([
+    ADMIN_PERMISSIONS.MANAGE_BOOKINGS,
+    ADMIN_PERMISSIONS.HANDLE_DISPUTES,
+    ADMIN_PERMISSIONS.VIEW_DASHBOARD,
+  ]),
+  validateQuery(paymentQueryFilterSchema),
+  paymentsController.listAdminPayments,
 );
 
 // -----------------------------------------------------------------------------

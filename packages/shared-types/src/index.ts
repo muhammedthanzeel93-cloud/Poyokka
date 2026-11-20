@@ -1331,6 +1331,10 @@ export interface PaymentDto {
   failureDescription?: string | null;
   reconciliationStatus?: string | null;
   paidAt?: string | null;
+  refundId?: string | null;
+  refundAmountPaise?: number | null;
+  refundedAt?: string | null;
+  refundReason?: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -1359,6 +1363,15 @@ export interface VerifyPaymentResponseDto {
   payment: PaymentDto;
   booking: BookingDto;
   isConfirmed: boolean;
+  message: string;
+}
+
+export interface RefundPaymentResponseDto {
+  payment: PaymentDto;
+  refundId: string;
+  amountPaise: number;
+  currency: string;
+  status: string;
   message: string;
 }
 

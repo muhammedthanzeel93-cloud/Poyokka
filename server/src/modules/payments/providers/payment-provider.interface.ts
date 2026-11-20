@@ -39,10 +39,28 @@ export interface ProviderPaymentResult {
   rawResponse?: Record<string, unknown>;
 }
 
+export interface CreateProviderRefundInput {
+  providerPaymentId: string;
+  amountPaise?: number;
+  currency?: string;
+  notes?: Record<string, string>;
+  receipt?: string;
+}
+
+export interface ProviderRefundResult {
+  refundId: string;
+  providerPaymentId: string;
+  amountPaise: number;
+  currency: string;
+  status: 'processed' | 'pending' | 'failed';
+  rawResponse?: Record<string, unknown>;
+}
+
 export interface IPaymentProvider {
   readonly providerName: PaymentProvider;
   createOrder(input: CreateProviderOrderInput): Promise<ProviderOrderResult>;
   verifyPaymentSignature(input: VerifyProviderPaymentSignatureInput): boolean;
   verifyWebhookSignature(input: VerifyWebhookSignatureInput): boolean;
   fetchPayment(providerPaymentId: string, expectedOrderId?: string): Promise<ProviderPaymentResult>;
+  createRefund(input: CreateProviderRefundInput): Promise<ProviderRefundResult>;
 }

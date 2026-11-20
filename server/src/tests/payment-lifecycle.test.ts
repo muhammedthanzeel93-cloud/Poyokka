@@ -14,6 +14,7 @@ import {
   INVENTORY_HOLD_STATUSES,
   PAYMENT_STATUSES,
   ADMIN_AUDIT_ACTIONS,
+  ADMIN_PERMISSIONS,
 } from '@kerala-tourism/constants';
 import { createApp } from '../loaders/app';
 import { authMiddleware } from '../middlewares/auth.middleware';
@@ -82,6 +83,7 @@ interface StoredBusinessProfile {
 class TestAuthRepository extends AuthRepository {
   public accounts: Map<string, StoredAccount> = new Map();
   public businessProfiles: Map<string, StoredBusinessProfile> = new Map();
+  public adminProfiles: Map<string, any> = new Map();
 
   public async findAccountById(id: string | Types.ObjectId): Promise<IAccountDocument | null> {
     const acc = this.accounts.get(id.toString());
@@ -104,6 +106,10 @@ class TestAuthRepository extends AuthRepository {
       businessType: prof.businessType,
       verificationStatus: prof.verificationStatus,
     } as unknown as IBusinessProfileDocument;
+  }
+
+  public async findAdminProfile(accountId: string | Types.ObjectId): Promise<any | null> {
+    return this.adminProfiles.get(accountId.toString()) || null;
   }
 }
 
@@ -147,6 +153,15 @@ describe('DAY 24 — Payment Integration, Payment Lifecycle & Webhook Security',
   const suspendedTouristId = new Types.ObjectId();
   const suspendedTouristEmail = 'suspended@keralatourism.local';
   let suspendedTouristToken: string;
+
+  // Admin Credentials
+  const adminId = new Types.ObjectId();
+  const adminEmail = 'admin@keralatourism.local';
+  let adminToken: string;
+
+  const unauthorizedAdminId = new Types.ObjectId();
+  const unauthorizedAdminEmail = 'unauthorized.admin@keralatourism.local';
+  let unauthorizedAdminToken: string;
 
   // Merchant & Property Identity
   const merchantAccountId = new Types.ObjectId();
@@ -258,6 +273,48 @@ describe('DAY 24 — Payment Integration, Payment Lifecycle & Webhook Security',
       email: suspendedTouristEmail,
       accountType: ACCOUNT_TYPES.TOURIST,
       status: ACCOUNT_STATUSES.SUSPENDED,
+    });
+
+    // Seed Authorized Admin (with MANAGE_BOOKINGS & HANDLE_DISPUTES)
+    testAuthRepo.accounts.set(adminId.toString(), {
+      _id: adminId,
+      email: adminEmail,
+      accountType: ACCOUNT_TYPES.ADMIN,
+      status: ACCOUNT_STATUSES.ACTIVE,
+    });
+    testAuthRepo.adminProfiles.set(adminId.toString(), {
+      _id: new Types.ObjectId(),
+      accountId: adminId,
+      permissions: [
+        ADMIN_PERMISSIONS.MANAGE_BOOKINGS,
+        ADMIN_PERMISSIONS.HANDLE_DISPUTES,
+        ADMIN_PERMISSIONS.VIEW_DASHBOARD,
+      ],
+    });
+    adminToken = jwtService.signAccessToken({
+      id: adminId.toString(),
+      email: adminEmail,
+      accountType: ACCOUNT_TYPES.ADMIN,
+      status: ACCOUNT_STATUSES.ACTIVE,
+    });
+
+    // Seed Unauthorized Admin (missing required permissions)
+    testAuthRepo.accounts.set(unauthorizedAdminId.toString(), {
+      _id: unauthorizedAdminId,
+      email: unauthorizedAdminEmail,
+      accountType: ACCOUNT_TYPES.ADMIN,
+      status: ACCOUNT_STATUSES.ACTIVE,
+    });
+    testAuthRepo.adminProfiles.set(unauthorizedAdminId.toString(), {
+      _id: new Types.ObjectId(),
+      accountId: unauthorizedAdminId,
+      permissions: [ADMIN_PERMISSIONS.VIEW_ANALYTICS],
+    });
+    unauthorizedAdminToken = jwtService.signAccessToken({
+      id: unauthorizedAdminId.toString(),
+      email: unauthorizedAdminEmail,
+      accountType: ACCOUNT_TYPES.ADMIN,
+      status: ACCOUNT_STATUSES.ACTIVE,
     });
 
     // Seed Merchant & Business Profile
@@ -1224,5 +1281,254 @@ describe('DAY 24 — Payment Integration, Payment Lifecycle & Webhook Security',
     assert.ok(actions.includes(ADMIN_AUDIT_ACTIONS.PAYMENT_INITIATED));
     assert.ok(actions.includes(ADMIN_AUDIT_ACTIONS.PAYMENT_CAPTURED));
     assert.ok(actions.includes(ADMIN_AUDIT_ACTIONS.BOOKING_CONFIRMED));
+  });
+
+  // ===========================================================================
+  // SECTION 6: ADMINISTRATIVE REFUND & RECONCILIATION MANAGEMENT (T01.3)
+  // ===========================================================================
+
+  it('29. Rejects admin refund request when unauthenticated', async () => {
+    const dummyPaymentId = new Types.ObjectId().toString();
+    const res = await dispatchRequest(app, 'POST', `/api/v1/admin/payments/${dummyPaymentId}/refund`, {
+      body: { reason: 'Unauthenticated attempt' },
+    });
+    assert.strictEqual(res.status, 401);
+  });
+
+  it('30. Rejects admin refund request when user is not an admin', async () => {
+    const dummyPaymentId = new Types.ObjectId().toString();
+    const res = await dispatchRequest(app, 'POST', `/api/v1/admin/payments/${dummyPaymentId}/refund`, {
+      token: touristToken,
+      body: { reason: 'Tourist attempt to refund' },
+    });
+    assert.strictEqual(res.status, 403);
+  });
+
+  it('31. Rejects admin refund request when admin lacks MANAGE_BOOKINGS or HANDLE_DISPUTES permissions', async () => {
+    const dummyPaymentId = new Types.ObjectId().toString();
+    const res = await dispatchRequest(app, 'POST', `/api/v1/admin/payments/${dummyPaymentId}/refund`, {
+      token: unauthorizedAdminToken,
+      body: { reason: 'Unauthorized admin attempt' },
+    });
+    assert.strictEqual(res.status, 403);
+  });
+
+  it('32. Rejects refund request for non-existent payment ID', async () => {
+    const nonExistentId = new Types.ObjectId().toString();
+    const res = await dispatchRequest(app, 'POST', `/api/v1/admin/payments/${nonExistentId}/refund`, {
+      token: adminToken,
+      body: { reason: 'Refund for missing payment' },
+    });
+    assert.strictEqual(res.status, 404);
+  });
+
+  it('33. Rejects refund request for uncaptured payment (e.g. CREATED status)', async () => {
+    const initRes = await dispatchRequest(app, 'POST', `/api/v1/tourist/bookings/${bookingId}/payments`, {
+      token: touristToken,
+    });
+    const paymentId = initRes.body.data.payment.id;
+
+    const res = await dispatchRequest(app, 'POST', `/api/v1/admin/payments/${paymentId}/refund`, {
+      token: adminToken,
+      body: { reason: 'Attempt to refund uncaptured payment' },
+    });
+    assert.strictEqual(res.status, 400);
+    assert.strictEqual(res.body.error.code, 'PAYMENT_NOT_CAPTURED');
+  });
+
+  it('34. Rejects refund when requested refund amount exceeds captured amount', async () => {
+    const initRes = await dispatchRequest(app, 'POST', `/api/v1/tourist/bookings/${bookingId}/payments`, {
+      token: touristToken,
+    });
+    const paymentId = initRes.body.data.payment.id;
+    const orderId = initRes.body.data.checkoutData.orderId;
+    const paymentProviderId = 'pay_excess_refund_01';
+
+    const validSignature = crypto
+      .createHmac('sha256', testKeySecret)
+      .update(`${orderId}|${paymentProviderId}`)
+      .digest('hex');
+
+    await dispatchRequest(app, 'POST', '/api/v1/tourist/payments/verify', {
+      token: touristToken,
+      body: {
+        paymentId,
+        razorpay_order_id: orderId,
+        razorpay_payment_id: paymentProviderId,
+        razorpay_signature: validSignature,
+      },
+    });
+
+    const res = await dispatchRequest(app, 'POST', `/api/v1/admin/payments/${paymentId}/refund`, {
+      token: adminToken,
+      body: {
+        amountPaise: 99999999, // Exceeds payment amount of 1500000 paise
+        reason: 'Attempted excess refund',
+      },
+    });
+    assert.strictEqual(res.status, 400);
+    assert.strictEqual(res.body.error.code, 'INVALID_REFUND_AMOUNT');
+  });
+
+  it('35. Successfully processes full admin refund on captured payment, records audit log and updates payment/booking', async () => {
+    const initRes = await dispatchRequest(app, 'POST', `/api/v1/tourist/bookings/${bookingId}/payments`, {
+      token: touristToken,
+    });
+    const paymentId = initRes.body.data.payment.id;
+    const orderId = initRes.body.data.checkoutData.orderId;
+    const paymentProviderId = 'pay_admin_refund_01';
+
+    const validSignature = crypto
+      .createHmac('sha256', testKeySecret)
+      .update(`${orderId}|${paymentProviderId}`)
+      .digest('hex');
+
+    await dispatchRequest(app, 'POST', '/api/v1/tourist/payments/verify', {
+      token: touristToken,
+      body: {
+        paymentId,
+        razorpay_order_id: orderId,
+        razorpay_payment_id: paymentProviderId,
+        razorpay_signature: validSignature,
+      },
+    });
+
+    const refundReason = 'Guest cancelled reservation within free cancellation window';
+    const res = await dispatchRequest(app, 'POST', `/api/v1/admin/payments/${paymentId}/refund`, {
+      token: adminToken,
+      body: { reason: refundReason },
+    });
+
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(res.body.success, true);
+    assert.ok(res.body.data.refundId.startsWith('rfnd_'));
+    assert.strictEqual(res.body.data.amountPaise, 1500000);
+    assert.strictEqual(res.body.data.payment.status, PAYMENT_STATUSES.REFUNDED);
+    assert.strictEqual(res.body.data.payment.refundReason, refundReason);
+    assert.ok(res.body.data.payment.refundedAt);
+
+    // Verify stored state
+    const storedPayment = testPaymentsRepo.inMemoryPayments.get(paymentId)!;
+    assert.strictEqual(storedPayment.status, PAYMENT_STATUSES.REFUNDED);
+    assert.strictEqual(storedPayment.refundAmountPaise, 1500000);
+    assert.strictEqual(storedPayment.refundReason, refundReason);
+    assert.strictEqual(storedPayment.reconciliationStatus, 'REFUNDED');
+
+    // Associated booking updated to CANCELLED
+    const storedBooking = testBookingsRepo.inMemoryBookings.get(bookingId.toString())!;
+    assert.strictEqual(storedBooking.status, BOOKING_STATUSES.CANCELLED);
+
+    // Verify Audit Log
+    const refundLogs = mockAudit.recordedLogs.filter((l) => l.action === ADMIN_AUDIT_ACTIONS.PAYMENT_REFUNDED);
+    assert.strictEqual(refundLogs.length, 1);
+    assert.strictEqual(refundLogs[0].targetEntityId.toString(), paymentId);
+    assert.strictEqual(refundLogs[0].reason, refundReason);
+  });
+
+  it('36. Successfully processes refund on late payment flagged with FLAGGED_FOR_MANUAL_REVIEW', async () => {
+    const initRes = await dispatchRequest(app, 'POST', `/api/v1/tourist/bookings/${bookingId}/payments`, {
+      token: touristToken,
+    });
+    const paymentId = initRes.body.data.payment.id;
+    const orderId = initRes.body.data.checkoutData.orderId;
+    const paymentProviderId = 'pay_late_refund_01';
+
+    // Simulate hold expired
+    const hold = testBookingsRepo.inMemoryHolds.get(holdId.toString())!;
+    hold.status = INVENTORY_HOLD_STATUSES.EXPIRED;
+    hold.expiresAt = new Date(Date.now() - 5000);
+
+    const validSignature = crypto
+      .createHmac('sha256', testKeySecret)
+      .update(`${orderId}|${paymentProviderId}`)
+      .digest('hex');
+
+    await dispatchRequest(app, 'POST', '/api/v1/tourist/payments/verify', {
+      token: touristToken,
+      body: {
+        paymentId,
+        razorpay_order_id: orderId,
+        razorpay_payment_id: paymentProviderId,
+        razorpay_signature: validSignature,
+      },
+    });
+
+    // Check payment is captured with FLAGGED_FOR_MANUAL_REVIEW
+    const flaggedPayment = testPaymentsRepo.inMemoryPayments.get(paymentId)!;
+    assert.strictEqual(flaggedPayment.reconciliationStatus, 'FLAGGED_FOR_MANUAL_REVIEW');
+
+    // Admin processes reconciliation refund
+    const res = await dispatchRequest(app, 'POST', `/api/v1/admin/payments/${paymentId}/refund`, {
+      token: adminToken,
+      body: { reason: 'Hold expired reconciliation refund to guest' },
+    });
+
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(res.body.data.payment.status, PAYMENT_STATUSES.REFUNDED);
+    assert.strictEqual(res.body.data.payment.reconciliationStatus, 'REFUNDED');
+
+    const updatedPayment = testPaymentsRepo.inMemoryPayments.get(paymentId)!;
+    assert.strictEqual(updatedPayment.status, PAYMENT_STATUSES.REFUNDED);
+    assert.strictEqual(updatedPayment.reconciliationStatus, 'REFUNDED');
+  });
+
+  it('37. Rejects repeated refund request on already refunded payment (idempotent guard)', async () => {
+    const initRes = await dispatchRequest(app, 'POST', `/api/v1/tourist/bookings/${bookingId}/payments`, {
+      token: touristToken,
+    });
+    const paymentId = initRes.body.data.payment.id;
+    const orderId = initRes.body.data.checkoutData.orderId;
+    const paymentProviderId = 'pay_double_refund_01';
+
+    const validSignature = crypto
+      .createHmac('sha256', testKeySecret)
+      .update(`${orderId}|${paymentProviderId}`)
+      .digest('hex');
+
+    await dispatchRequest(app, 'POST', '/api/v1/tourist/payments/verify', {
+      token: touristToken,
+      body: {
+        paymentId,
+        razorpay_order_id: orderId,
+        razorpay_payment_id: paymentProviderId,
+        razorpay_signature: validSignature,
+      },
+    });
+
+    // First refund succeeds
+    const firstRes = await dispatchRequest(app, 'POST', `/api/v1/admin/payments/${paymentId}/refund`, {
+      token: adminToken,
+      body: { reason: 'First refund' },
+    });
+    assert.strictEqual(firstRes.status, 200);
+
+    // Second refund fails
+    const secondRes = await dispatchRequest(app, 'POST', `/api/v1/admin/payments/${paymentId}/refund`, {
+      token: adminToken,
+      body: { reason: 'Duplicate second refund attempt' },
+    });
+    assert.strictEqual(secondRes.status, 400);
+    assert.strictEqual(secondRes.body.error.code, 'PAYMENT_ALREADY_REFUNDED');
+  });
+
+  it('38. Admin can retrieve payment details and list payments by reconciliationStatus', async () => {
+    const initRes = await dispatchRequest(app, 'POST', `/api/v1/tourist/bookings/${bookingId}/payments`, {
+      token: touristToken,
+    });
+    const paymentId = initRes.body.data.payment.id;
+
+    // Get payment by ID
+    const getRes = await dispatchRequest(app, 'GET', `/api/v1/admin/payments/${paymentId}`, {
+      token: adminToken,
+    });
+    assert.strictEqual(getRes.status, 200);
+    assert.strictEqual(getRes.body.data.id, paymentId);
+
+    // List payments
+    const listRes = await dispatchRequest(app, 'GET', '/api/v1/admin/payments', {
+      token: adminToken,
+    });
+    assert.strictEqual(listRes.status, 200);
+    assert.ok(listRes.body.data.payments.length >= 1);
   });
 });

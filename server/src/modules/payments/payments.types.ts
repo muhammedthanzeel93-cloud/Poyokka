@@ -7,6 +7,7 @@ import {
   RazorpayCheckoutDataDto,
   CreatePaymentResponseDto,
   VerifyPaymentResponseDto,
+  RefundPaymentResponseDto,
   PaymentWebhookResultDto,
 } from '@kerala-tourism/shared-types';
 
@@ -27,6 +28,10 @@ export interface IPaymentLean {
   failureDescription?: string | null;
   reconciliationStatus?: string | null;
   paidAt?: Date | null;
+  refundId?: string | null;
+  refundAmountPaise?: number | null;
+  refundedAt?: Date | null;
+  refundReason?: string | null;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -76,5 +81,6 @@ export type {
   RazorpayCheckoutDataDto,
   CreatePaymentResponseDto,
   VerifyPaymentResponseDto,
+  RefundPaymentResponseDto,
   PaymentWebhookResultDto,
 };

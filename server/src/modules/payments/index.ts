@@ -13,5 +13,6 @@ export {
   default as paymentsRoutes,
   touristPaymentRoutes,
   touristBookingPaymentRoutes,
+  adminPaymentRoutes,
 } from './payments.routes';
 export { default as webhookRoutes } from './webhook.routes';

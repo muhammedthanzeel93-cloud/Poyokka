@@ -123,6 +123,51 @@ export class PaymentsController {
       next(err);
     }
   };
+
+  public refundPayment = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+    try {
+      const adminAccountId = req.user!.id;
+      const { paymentId } = req.params;
+      const result = await this.service.refundPayment(adminAccountId, paymentId, req.body);
+
+      res.status(200).json({
+        success: true,
+        message: result.message,
+        data: result,
+      });
+    } catch (err) {
+      next(err);
+    }
+  };
+
+  public getAdminPaymentById = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+    try {
+      const { paymentId } = req.params;
+      const result = await this.service.getAdminPaymentById(paymentId);
+
+      res.status(200).json({
+        success: true,
+        message: 'Payment retrieved successfully',
+        data: result,
+      });
+    } catch (err) {
+      next(err);
+    }
+  };
+
+  public listAdminPayments = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+    try {
+      const result = await this.service.listPayments(req.query as any);
+
+      res.status(200).json({
+        success: true,
+        message: 'Payments retrieved successfully',
+        data: result,
+      });
+    } catch (err) {
+      next(err);
+    }
+  };
 }
 
 export const paymentsController = new PaymentsController();

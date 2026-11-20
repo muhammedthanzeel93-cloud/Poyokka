@@ -8,6 +8,8 @@ import {
   VerifyProviderPaymentSignatureInput,
   VerifyWebhookSignatureInput,
   ProviderPaymentResult,
+  CreateProviderRefundInput,
+  ProviderRefundResult,
 } from './payment-provider.interface';
 
 export class RazorpayPaymentProvider implements IPaymentProvider {
@@ -17,6 +19,7 @@ export class RazorpayPaymentProvider implements IPaymentProvider {
     { orderId: string; amountPaise: number; currency: string; receipt: string; notes?: Record<string, string> }
   > = new Map();
   private readonly simulatedPayments: Map<string, ProviderPaymentResult> = new Map();
+  private readonly simulatedRefunds: Map<string, ProviderRefundResult> = new Map();
 
   constructor(
     private readonly keyId: string,
@@ -242,12 +245,113 @@ export class RazorpayPaymentProvider implements IPaymentProvider {
     }
   }
 
+  public async createRefund(input: CreateProviderRefundInput): Promise<ProviderRefundResult> {
+    if (this.isSimulated) {
+      // 1. Explicit mock override for testing
+      const explicit = this.simulatedRefunds.get(input.providerPaymentId);
+      if (explicit) {
+        return explicit;
+      }
+
+      // 2. Simulated failure convention
+      if (input.providerPaymentId.startsWith('pay_fail_refund_')) {
+        throw new BadGatewayError('Simulated refund gateway failure', 'PAYMENT_GATEWAY_ERROR', {
+          status: 400,
+          code: 'BAD_REQUEST_ERROR',
+        });
+      }
+
+      const refundId = `rfnd_${crypto.randomBytes(8).toString('hex')}`;
+      const amountPaise = input.amountPaise ?? 500000;
+      const currency = input.currency || 'INR';
+
+      const result: ProviderRefundResult = {
+        refundId,
+        providerPaymentId: input.providerPaymentId,
+        amountPaise,
+        currency,
+        status: 'processed',
+        rawResponse: {
+          id: refundId,
+          entity: 'refund',
+          amount: amountPaise,
+          currency,
+          payment_id: input.providerPaymentId,
+          status: 'processed',
+          receipt: input.receipt,
+          notes: input.notes || {},
+          created_at: Math.floor(Date.now() / 1000),
+          simulated: true,
+        },
+      };
+
+      this.simulatedRefunds.set(input.providerPaymentId, result);
+      return result;
+    }
+
+    try {
+      const authHeader = 'Basic ' + Buffer.from(`${this.keyId}:${this.keySecret}`).toString('base64');
+      const bodyPayload: Record<string, any> = {};
+      if (input.amountPaise !== undefined) {
+        bodyPayload.amount = input.amountPaise;
+      }
+      if (input.notes) {
+        bodyPayload.notes = input.notes;
+      }
+      if (input.receipt) {
+        bodyPayload.receipt = input.receipt;
+      }
+
+      const response = await fetch(`https://api.razorpay.com/v1/payments/${input.providerPaymentId}/refund`, {
+        method: 'POST',
+        headers: {
+          Authorization: authHeader,
+          'Content-Type': 'application/json',
+        },
+        body: Object.keys(bodyPayload).length > 0 ? JSON.stringify(bodyPayload) : undefined,
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        const description = (errorData as any)?.error?.description || `HTTP ${response.status}`;
+        throw new BadGatewayError(`Razorpay refund failed: ${description}`, 'PAYMENT_GATEWAY_ERROR', {
+          status: response.status,
+          code: (errorData as any)?.error?.code,
+        });
+      }
+
+      const data = (await response.json()) as any;
+      return {
+        refundId: data.id,
+        providerPaymentId: data.payment_id || input.providerPaymentId,
+        amountPaise: data.amount,
+        currency: data.currency || 'INR',
+        status: data.status === 'processed' ? 'processed' : (data.status === 'pending' ? 'pending' : 'failed'),
+        rawResponse: data,
+      };
+    } catch (err: unknown) {
+      if (err instanceof AppError) {
+        throw err;
+      }
+      const safeMsg = err instanceof Error ? err.message : 'Unknown network error';
+      throw new BadGatewayError(
+        `Payment gateway communication failure during refund creation: ${safeMsg}`,
+        'PAYMENT_GATEWAY_NETWORK_ERROR',
+      );
+    }
+  }
+
   public setSimulatedPayment(paymentId: string, result: ProviderPaymentResult): void {
     this.simulatedPayments.set(paymentId, result);
+  }
+
+  public setSimulatedRefund(paymentId: string, result: ProviderRefundResult): void {
+    this.simulatedRefunds.set(paymentId, result);
   }
 
   public clearSimulatedData(): void {
     this.simulatedOrders.clear();
     this.simulatedPayments.clear();
+    this.simulatedRefunds.clear();
   }
 }

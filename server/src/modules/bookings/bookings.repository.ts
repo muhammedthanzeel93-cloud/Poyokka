@@ -593,6 +593,33 @@ export class BookingsRepository {
     return { items, total };
   }
 
+  public async updateBooking(
+    bookingId: string | Types.ObjectId,
+    update: Partial<IBookingLean>,
+    session?: ClientSession,
+  ): Promise<IBookingLean | null> {
+    const idStr = bookingId.toString();
+    if (mongoose.connection.readyState === 0) {
+      const b = this.inMemoryBookings.get(idStr);
+      if (!b) return null;
+      const updated: IBookingLean = {
+        ...b,
+        ...update,
+        updatedAt: new Date(),
+      };
+      this.inMemoryBookings.set(idStr, updated);
+      return updated;
+    }
+
+    return BookingModel.findByIdAndUpdate(
+      bookingId,
+      { $set: update },
+      { new: true, session },
+    )
+      .lean<IBookingLean>()
+      .exec();
+  }
+
   // Backward compatibility methods for Day 05 stubs
   public async findById(id: string): Promise<IBookingLean | null> {
     return this.findBookingById(id);

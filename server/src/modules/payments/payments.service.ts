@@ -21,12 +21,17 @@ import { PropertyRepository, propertyRepository } from '../properties/property.r
 import { AuditLogService, auditLogService } from '../admin/audit-log.service';
 import { NotificationService, notificationService } from '../notifications/notification.service';
 import { NOTIFICATION_TYPES } from '@kerala-tourism/constants';
+import {
+  RefundPaymentInput,
+  PaymentQueryFilterInput,
+} from '@kerala-tourism/validation';
 import { generatePaymentReference } from './payments.validation';
 import {
   IPaymentLean,
   PaymentDto,
   CreatePaymentResponseDto,
   VerifyPaymentResponseDto,
+  RefundPaymentResponseDto,
 } from './payments.types';
 
 export class PaymentsService {
@@ -118,6 +123,14 @@ export class PaymentsService {
           ? payment.paidAt.toISOString()
           : new Date(payment.paidAt).toISOString()
         : null,
+      refundId: payment.refundId || null,
+      refundAmountPaise: payment.refundAmountPaise ?? null,
+      refundedAt: payment.refundedAt
+        ? payment.refundedAt instanceof Date
+          ? payment.refundedAt.toISOString()
+          : new Date(payment.refundedAt).toISOString()
+        : null,
+      refundReason: payment.refundReason || null,
       createdAt:
         payment.createdAt instanceof Date
           ? payment.createdAt.toISOString()
@@ -586,6 +599,165 @@ export class PaymentsService {
     return {
       status: 'ready',
       module: 'payments',
+    };
+  }
+
+  // ---------------------------------------------------------------------------
+  // ADMINISTRATIVE REFUND & DISPUTE APIS
+  // ---------------------------------------------------------------------------
+
+  public async refundPayment(
+    adminAccountId: string,
+    paymentId: string,
+    input: RefundPaymentInput = {},
+  ): Promise<RefundPaymentResponseDto> {
+    const payment = await this.repo.findPaymentById(paymentId);
+    if (!payment) {
+      throw new NotFoundError('Payment record not found', 'PAYMENT_NOT_FOUND');
+    }
+
+    // 1. Guard: Cannot refund an already refunded payment
+    if (payment.status === PAYMENT_STATUSES.REFUNDED) {
+      throw new BadRequestError('Payment has already been refunded', 'PAYMENT_ALREADY_REFUNDED');
+    }
+
+    // 2. Guard: Only CAPTURED payments can be refunded
+    if (payment.status !== PAYMENT_STATUSES.CAPTURED) {
+      throw new BadRequestError(
+        `Cannot refund payment with status '${payment.status}'. Only captured payments can be refunded.`,
+        'PAYMENT_NOT_CAPTURED',
+      );
+    }
+
+    // 3. Guard: Gateway payment ID must be present
+    if (!payment.providerPaymentId) {
+      throw new BadRequestError(
+        'Payment does not have an associated gateway provider payment ID',
+        'MISSING_PROVIDER_PAYMENT_ID',
+      );
+    }
+
+    // 4. Validate refund amount
+    const refundAmountPaise = input.amountPaise !== undefined ? input.amountPaise : payment.amountPaise;
+    if (refundAmountPaise <= 0 || refundAmountPaise > payment.amountPaise) {
+      throw new BadRequestError(
+        `Refund amount (${refundAmountPaise} paise) must be positive and cannot exceed payment amount (${payment.amountPaise} paise)`,
+        'INVALID_REFUND_AMOUNT',
+      );
+    }
+
+    // 5. Invoke Payment Provider Gateway Refund API
+    const refundResult = await this.provider.createRefund({
+      providerPaymentId: payment.providerPaymentId,
+      amountPaise: refundAmountPaise,
+      currency: payment.currency,
+      notes: {
+        paymentReference: payment.paymentReference,
+        adminAccountId,
+        reason: input.reason || 'Administrative refund processed',
+      },
+      receipt: `rcpt_rfnd_${payment.paymentReference}`,
+    });
+
+    const now = new Date();
+
+    // 6. Update Payment Record
+    const updatedPayment = await this.repo.updatePayment(payment._id, {
+      status: PAYMENT_STATUSES.REFUNDED,
+      refundId: refundResult.refundId,
+      refundAmountPaise: refundResult.amountPaise,
+      refundedAt: now,
+      refundReason: input.reason || 'Administrative refund processed',
+      reconciliationStatus: 'REFUNDED',
+    });
+
+    // 7. If associated booking was AWAITING_PAYMENT or CONFIRMED, update to CANCELLED
+    const booking = await this.bookingsRepo.findBookingById(payment.bookingId);
+    if (
+      booking &&
+      booking.status !== BOOKING_STATUSES.CANCELLED &&
+      booking.status !== BOOKING_STATUSES.EXPIRED
+    ) {
+      await this.bookingsRepo.updateBooking(booking._id, {
+        status: BOOKING_STATUSES.CANCELLED,
+      });
+    }
+
+    // 8. Record Immutable Audit Log
+    await this.auditService.recordAdminAction({
+      actorAccountId: adminAccountId,
+      actorAccountType: 'ADMIN',
+      action: ADMIN_AUDIT_ACTIONS.PAYMENT_REFUNDED,
+      targetEntityId: payment._id,
+      targetEntityType: AUDIT_TARGET_ENTITY_TYPES.PAYMENT,
+      reason: input.reason || 'Administrative refund processed',
+      beforeState: {
+        status: payment.status,
+        reconciliationStatus: payment.reconciliationStatus,
+      },
+      afterState: {
+        status: PAYMENT_STATUSES.REFUNDED,
+        refundId: refundResult.refundId,
+        refundAmountPaise: refundResult.amountPaise,
+        reconciliationStatus: 'REFUNDED',
+      },
+    });
+
+    // 9. Dispatch Guest Notification
+    await this.notifService
+      .publishEvent({
+        recipientAccountId: payment.touristAccountId.toString(),
+        notificationType: NOTIFICATION_TYPES.PAYMENT_REFUNDED,
+        title: 'Payment Refund Processed',
+        body: `A refund of ₹${(refundResult.amountPaise / 100).toFixed(2)} for payment ${payment.paymentReference} has been processed to your original payment method.`,
+        dataPayload: {
+          route: 'booking_details',
+          bookingId: payment.bookingId.toString(),
+          paymentId: payment._id.toString(),
+          refundId: refundResult.refundId,
+        },
+        relatedResourceType: 'PAYMENT',
+        relatedResourceId: payment._id.toString(),
+        idempotencyKey: `evt_refund_${payment._id.toString()}_${refundResult.refundId}`,
+      })
+      .catch((err) => console.error('[Notification Publish Error]:', err));
+
+    return {
+      payment: this.mapPaymentToDto(updatedPayment || payment),
+      refundId: refundResult.refundId,
+      amountPaise: refundResult.amountPaise,
+      currency: refundResult.currency,
+      status: refundResult.status,
+      message: `Refund of ₹${(refundResult.amountPaise / 100).toFixed(2)} processed successfully`,
+    };
+  }
+
+  public async getAdminPaymentById(paymentId: string): Promise<PaymentDto> {
+    const payment = await this.repo.findPaymentById(paymentId);
+    if (!payment) {
+      throw new NotFoundError('Payment record not found', 'PAYMENT_NOT_FOUND');
+    }
+    return this.mapPaymentToDto(payment);
+  }
+
+  public async listPayments(
+    filter: PaymentQueryFilterInput,
+  ): Promise<{ payments: PaymentDto[]; total: number; page: number; limit: number; totalPages: number }> {
+    const page = filter.page || 1;
+    const limit = filter.limit || 20;
+    const result = await this.repo.listPayments({
+      status: filter.status as any,
+      reconciliationStatus: filter.reconciliationStatus,
+      page,
+      limit,
+    });
+
+    return {
+      payments: result.items.map((p) => this.mapPaymentToDto(p)),
+      total: result.total,
+      page,
+      limit,
+      totalPages: Math.ceil(result.total / limit) || 1,
     };
   }
 }

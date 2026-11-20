@@ -24,6 +24,7 @@ import { adminModerationRoutes } from '../moderation';
 import { adminAgencyRoutes } from '../agencies/agency.routes';
 import { adminPackageRoutes } from '../packages';
 import { adminPropertyRoutes } from '../properties';
+import { adminPaymentRoutes } from '../payments';
 import { authorizationController } from './authorization.controller';
 import { destinationsController } from '../destinations/destinations.controller';
 import { ACCOUNT_TYPES, ADMIN_PERMISSIONS } from '@kerala-tourism/constants';
@@ -168,5 +169,8 @@ router.use('/packages', adminPackageRoutes);
 
 // Admin Accommodation Property Moderation & Management (Day 21)
 router.use('/properties', adminPropertyRoutes);
+
+// Admin Payment & Reconciliation Management (T01.3)
+router.use('/payments', adminPaymentRoutes);
 
 export default router;
