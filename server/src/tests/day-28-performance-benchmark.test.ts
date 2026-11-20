@@ -14,6 +14,8 @@ import {
   BOOKING_STATUSES,
   NOTIFICATION_DELIVERY_STATUSES,
   NOTIFICATION_TYPES,
+  POST_STATUSES,
+  POST_VISIBILITIES,
 } from '@kerala-tourism/constants';
 import {
   resolveTestMongoUri,
@@ -90,12 +92,16 @@ describe('DAY 28 — Performance Benchmark & Query Optimization Suite', () => {
             description: 'Pristine Kerala backwater and hill station sanctuary',
             district: districts[i % districts.length],
             locality: 'Local Area',
+            address: '123 Heritage Way, Wayanad',
+            createdBy: testTouristId,
             location: {
               type: 'Point' as const,
-              coordinates: [76.2 + i * 0.01, 10.5 + i * 0.01],
+              coordinates: [76.2 + (i % 10) * 0.01, 10.5 + (i % 10) * 0.01],
             },
             category: 'NATURE',
             status: i % 5 === 0 ? 'DRAFT' : 'PUBLISHED',
+            verificationStatus: 'VERIFIED',
+            publicationStatus: i % 5 === 0 ? 'DRAFT' : 'PUBLISHED',
             rating: 3.5 + (i % 15) * 0.1,
             reviewCount: i * 3,
             createdAt: new Date(Date.now() - i * 3600000),
@@ -106,12 +112,19 @@ describe('DAY 28 — Performance Benchmark & Query Optimization Suite', () => {
         const posts = [];
         for (let i = 0; i < 60; i++) {
           posts.push({
+            authorId: i % 2 === 0 ? testTouristId : new Types.ObjectId(),
             authorAccountId: i % 2 === 0 ? testTouristId : new Types.ObjectId(),
+            content: `Exploring beautiful Kerala #${i}`,
             caption: `Exploring beautiful Kerala #${i}`,
             media: [],
+            mediaIds: [],
+            visibility: POST_VISIBILITIES.PUBLIC,
+            status: POST_STATUSES.PUBLISHED,
             likesCount: i * 5,
             commentsCount: i * 2,
+            repostsCount: 0,
             isPublished: i % 10 !== 0,
+            publishedAt: new Date(Date.now() - i * 1800000),
             createdAt: new Date(Date.now() - i * 1800000),
           });
         }
@@ -135,6 +148,31 @@ describe('DAY 28 — Performance Benchmark & Query Optimization Suite', () => {
             stayDates: ['2026-12-01', '2026-12-02', '2026-12-03'],
             numberOfNights: 3,
             numberOfRooms: 1,
+            adults: 2,
+            nights: 3,
+            priceSnapshot: {
+              basePricePaise: 300000,
+              basePriceInr: 3000,
+              numberOfRooms: 1,
+              numberOfNights: 3,
+              dailyBreakdown: [
+                { date: '2026-12-01', pricePaise: 300000, priceInr: 3000 },
+                { date: '2026-12-02', pricePaise: 300000, priceInr: 3000 },
+                { date: '2026-12-03', pricePaise: 300000, priceInr: 3000 },
+              ],
+              subtotalPaise: 900000,
+              subtotalInr: 9000,
+              taxesPaise: 0,
+              taxesInr: 0,
+              totalPaise: 900000,
+              totalInr: 9000,
+              currency: 'INR',
+            },
+            guestDetails: {
+              primaryGuestName: 'Test Tourist',
+              email: 'tourist@example.com',
+              phone: '+919876543210',
+            },
             totalAmount: 9000,
             currency: 'INR',
             status: statuses[i % statuses.length],
@@ -181,23 +219,23 @@ describe('DAY 28 — Performance Benchmark & Query Optimization Suite', () => {
         const properties = [];
         for (let i = 0; i < 30; i++) {
           properties.push({
+            name: `Kerala Luxury Villa ${i}`,
             title: `Kerala Luxury Villa ${i}`,
             slug: `kerala-luxury-villa-${i}`,
             description: 'Exquisite backwater and plantation retreat',
             businessProfileId: testBusinessId,
+            accountId: testBusinessId,
+            createdBy: testBusinessId,
+            updatedBy: testBusinessId,
             propertyType: 'RESORT',
             status: 'PUBLISHED',
             isVerified: true,
-            address: {
-              street: `${i} Coconut Grove`,
-              locality: 'Kumarakom',
-              district: 'Kottayam',
-              pincode: '686563',
-              state: 'Kerala',
-            },
+            address: `${i} Coconut Grove, Kumarakom`,
+            district: 'Kottayam',
+            state: 'Kerala',
             location: {
               type: 'Point' as const,
-              coordinates: [76.4 + i * 0.01, 9.6 + i * 0.01],
+              coordinates: [76.4 + (i % 10) * 0.01, 9.6 + (i % 10) * 0.01],
             },
             rating: 4.2 + (i % 8) * 0.1,
             reviewCount: i * 4,
@@ -366,17 +404,24 @@ describe('DAY 28 — Performance Benchmark & Query Optimization Suite', () => {
       return;
     }
 
-    // Destinations public filter & sort
-    const destExplain: any = await DestinationModel.find({ status: 'PUBLISHED', district: 'Wayanad' })
-      .sort({ rating: -1, createdAt: -1 })
+    // Destinations public filter & sort (uses compound index { verificationStatus: 1, publicationStatus: 1, createdAt: -1 })
+    const destExplain: any = await DestinationModel.find({
+      verificationStatus: 'VERIFIED',
+      publicationStatus: 'PUBLISHED',
+    })
+      .sort({ createdAt: -1 })
       .explain('executionStats');
     const destStages = destExplain.executionStats.executionStages;
     assert.ok(findStage(destStages, 'IXSCAN'), 'Destinations query must use IXSCAN');
     assert.strictEqual(findStage(destStages, 'SORT'), null, 'Destinations query must not use in-memory SORT');
 
-    // Social Feed
-    const postExplain: any = await PostModel.find({ isPublished: true })
-      .sort({ createdAt: -1, _id: -1 })
+    // Social Feed (uses partial compound index idx_public_feed: { visibility: 1, status: 1, deletedAt: 1, publishedAt: -1, _id: -1 })
+    const postExplain: any = await PostModel.find({
+      visibility: POST_VISIBILITIES.PUBLIC,
+      status: POST_STATUSES.PUBLISHED,
+      deletedAt: null,
+    })
+      .sort({ publishedAt: -1, _id: -1 })
       .limit(20)
       .explain('executionStats');
     const postStages = postExplain.executionStats.executionStages;
