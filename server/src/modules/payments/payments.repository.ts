@@ -358,28 +358,57 @@ export class PaymentsRepository {
 
     const p = await PaymentModel.findById(paymentId).session(session || null);
     if (!p) return null;
-    const currentCumulative = (p.cumulativeRefundedPaise || 0) + amountPaise;
-    const currentPending = Math.max(0, (p.pendingRefundPaise || 0) - amountPaise);
-    const isFullyRefunded = currentCumulative >= p.amountPaise;
 
-    const updateSet: Record<string, any> = {
-      cumulativeRefundedPaise: currentCumulative,
-      pendingRefundPaise: currentPending,
-      refundAmountPaise: currentCumulative,
-      refundId: latestRefundId,
-      refundedAt: new Date(),
-      status: isFullyRefunded ? PAYMENT_STATUSES.REFUNDED : PAYMENT_STATUSES.CAPTURED,
-      reconciliationStatus: isFullyRefunded ? 'REFUNDED' : 'PARTIALLY_REFUNDED',
-    };
-    if (reason !== undefined) {
-      updateSet.refundReason = reason;
-    }
+    const updatePipeline: any[] = [
+      {
+        $set: {
+          cumulativeRefundedPaise: {
+            $add: [{ $ifNull: ['$cumulativeRefundedPaise', 0] }, amountPaise],
+          },
+          pendingRefundPaise: {
+            $max: [
+              0,
+              { $subtract: [{ $ifNull: ['$pendingRefundPaise', 0] }, amountPaise] },
+            ],
+          },
+          refundAmountPaise: {
+            $add: [{ $ifNull: ['$cumulativeRefundedPaise', 0] }, amountPaise],
+          },
+          refundId: latestRefundId,
+          refundedAt: '$$NOW',
+          updatedAt: '$$NOW',
+          status: {
+            $cond: [
+              {
+                $gte: [
+                  { $add: [{ $ifNull: ['$cumulativeRefundedPaise', 0] }, amountPaise] },
+                  '$amountPaise',
+                ],
+              },
+              PAYMENT_STATUSES.REFUNDED,
+              PAYMENT_STATUSES.CAPTURED,
+            ],
+          },
+          reconciliationStatus: {
+            $cond: [
+              {
+                $gte: [
+                  { $add: [{ $ifNull: ['$cumulativeRefundedPaise', 0] }, amountPaise] },
+                  '$amountPaise',
+                ],
+              },
+              'REFUNDED',
+              'PARTIALLY_REFUNDED',
+            ],
+          },
+          ...(reason !== undefined && reason !== null ? { refundReason: reason } : {}),
+        },
+      },
+    ];
 
     return PaymentModel.findByIdAndUpdate(
       paymentId,
-      {
-        $set: updateSet,
-      },
+      updatePipeline,
       { new: true, session },
     )
       .lean<IPaymentLean>()
@@ -409,16 +438,36 @@ export class PaymentsRepository {
 
     const p = await PaymentModel.findById(paymentId).session(session || null);
     if (!p) return null;
-    const currentPending = Math.max(0, (p.pendingRefundPaise || 0) - amountPaise);
+
+    const updatePipeline: any[] = [
+      {
+        $set: {
+          pendingRefundPaise: {
+            $max: [
+              0,
+              { $subtract: [{ $ifNull: ['$pendingRefundPaise', 0] }, amountPaise] },
+            ],
+          },
+          status: {
+            $cond: [
+              {
+                $gte: [
+                  { $ifNull: ['$cumulativeRefundedPaise', 0] },
+                  '$amountPaise',
+                ],
+              },
+              PAYMENT_STATUSES.REFUNDED,
+              PAYMENT_STATUSES.CAPTURED,
+            ],
+          },
+          updatedAt: '$$NOW',
+        },
+      },
+    ];
 
     return PaymentModel.findByIdAndUpdate(
       paymentId,
-      {
-        $set: {
-          pendingRefundPaise: currentPending,
-          status: (p.cumulativeRefundedPaise || 0) >= p.amountPaise ? PAYMENT_STATUSES.REFUNDED : PAYMENT_STATUSES.CAPTURED,
-        },
-      },
+      updatePipeline,
       { new: true, session },
     )
       .lean<IPaymentLean>()

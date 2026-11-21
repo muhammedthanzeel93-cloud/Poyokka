@@ -14,11 +14,14 @@ import {
   INVENTORY_HOLD_STATUSES,
   PAYMENT_STATUSES,
   REFUND_STATUSES,
+  PAYMENT_PROVIDERS,
+  PAYMENT_WEBHOOK_STATUSES,
   NOTIFICATION_TYPES,
   ADMIN_AUDIT_ACTIONS,
   ADMIN_PERMISSIONS,
 } from '@kerala-tourism/constants';
 import { createApp } from '../loaders/app';
+import { InternalServerError } from '../shared/errors/AppError';
 import { authMiddleware } from '../middlewares/auth.middleware';
 import { authorizationMiddleware } from '../middlewares/authorization.middleware';
 import { resetRateLimiter } from '../middlewares/rateLimiter';
@@ -241,8 +244,11 @@ describe('DAY 24 — Payment Integration, Payment Lifecycle & Webhook Security',
     paymentsService.setNotificationService(mockNotif);
 
     webhookService.setRepository(testPaymentsRepo);
+    webhookService.setRefundsRepository(testRefundsRepo);
+    webhookService.setBookingsRepository(testBookingsRepo);
     webhookService.setProvider(testProvider);
     webhookService.setAuditService(mockAudit);
+    webhookService.setNotificationService(mockNotif);
 
     // Link in-memory stores between bookings and payments
     testPaymentsRepo.setBookingMemoryStores(
@@ -2072,5 +2078,1112 @@ describe('DAY 24 — Payment Integration, Payment Lifecycle & Webhook Security',
     assert.strictEqual(res.body.success, true);
     assert.strictEqual(res.body.data.id, refundId);
     assert.strictEqual(res.body.data.amountPaise, 500000);
+  });
+
+  // ===========================================================================
+  // SECTION 7: ADVERSARIAL REFUND WEBHOOK PROCESSING (T01.3-R1)
+  // ===========================================================================
+
+  const dispatchWebhook = async (body: any, eventId?: string, signature?: string) => {
+    const rawStr = JSON.stringify(body);
+    const sig =
+      signature !== undefined
+        ? signature
+        : crypto.createHmac('sha256', testWebhookSecret).update(rawStr).digest('hex');
+    const headers: Record<string, string> = {
+      'content-type': 'application/json',
+    };
+    if (sig) {
+      headers['x-razorpay-signature'] = sig;
+    }
+    if (eventId) {
+      headers['x-razorpay-event-id'] = eventId;
+    }
+    return dispatchRequest(app, 'POST', '/api/v1/webhooks/razorpay', {
+      headers,
+      body,
+    });
+  };
+
+  it('51. Valid refund.processed event updates refund to PROCESSED and settles payment balance', async () => {
+    const initRes = await dispatchRequest(app, 'POST', `/api/v1/tourist/bookings/${bookingId}/payments`, {
+      token: touristToken,
+    });
+    const paymentId = initRes.body.data.payment.id;
+    const orderId = initRes.body.data.checkoutData.orderId;
+    const paymentProviderId = 'pay_pending_refund_wh_01';
+
+    const validSignature = crypto
+      .createHmac('sha256', testKeySecret)
+      .update(`${orderId}|${paymentProviderId}`)
+      .digest('hex');
+
+    await dispatchRequest(app, 'POST', '/api/v1/tourist/payments/verify', {
+      token: touristToken,
+      body: {
+        paymentId,
+        razorpay_order_id: orderId,
+        razorpay_payment_id: paymentProviderId,
+        razorpay_signature: validSignature,
+      },
+    });
+
+    // Admin initiates partial refund (5,000 INR) -> pending at gateway
+    const refundRes = await dispatchRequest(app, 'POST', `/api/v1/admin/payments/${paymentId}/refund`, {
+      token: adminToken,
+      body: { amountPaise: 500000, reason: 'Webhook test refund' },
+    });
+    assert.strictEqual(refundRes.status, 200);
+    assert.strictEqual(refundRes.body.data.refund.status, REFUND_STATUSES.PENDING);
+    assert.strictEqual(refundRes.body.data.payment.status, PAYMENT_STATUSES.REFUND_PENDING);
+    const refundRecordId = refundRes.body.data.refund.id;
+    const providerRefundId = refundRes.body.data.refundId;
+
+    const webhookBody = {
+      event: 'refund.processed',
+      payload: {
+        refund: {
+          entity: {
+            id: providerRefundId,
+            payment_id: paymentProviderId,
+            amount: 500000,
+            currency: 'INR',
+            status: 'processed',
+            created_at: Math.floor(Date.now() / 1000),
+          },
+        },
+      },
+    };
+
+    const res = await dispatchWebhook(webhookBody, 'evt_rfnd_proc_01');
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(res.body.data.status, 'PROCESSED');
+
+    // Stored refund is PROCESSED
+    const storedRefund = testRefundsRepo.inMemoryRefunds.get(refundRecordId)!;
+    assert.strictEqual(storedRefund.status, REFUND_STATUSES.PROCESSED);
+
+    // Stored payment is CAPTURED, cumulativeRefundedPaise is 500,000, pending is 0
+    const storedPayment = testPaymentsRepo.inMemoryPayments.get(paymentId)!;
+    assert.strictEqual(storedPayment.status, PAYMENT_STATUSES.CAPTURED);
+    assert.strictEqual(storedPayment.cumulativeRefundedPaise, 500000);
+    assert.strictEqual(storedPayment.pendingRefundPaise, 0);
+
+    // Audit log and notification
+    const auditLogs = mockAudit.recordedLogs.filter((l) => l.action === ADMIN_AUDIT_ACTIONS.PAYMENT_REFUNDED);
+    assert.ok(auditLogs.length >= 1);
+    const notifs = mockNotif.publishedEvents.filter((n) => n.notificationType === NOTIFICATION_TYPES.PAYMENT_REFUNDED);
+    assert.ok(notifs.length >= 1);
+  });
+
+  it('52. Valid refund.failed event updates refund to FAILED and releases reserved balance', async () => {
+    const initRes = await dispatchRequest(app, 'POST', `/api/v1/tourist/bookings/${bookingId}/payments`, {
+      token: touristToken,
+    });
+    const paymentId = initRes.body.data.payment.id;
+    const orderId = initRes.body.data.checkoutData.orderId;
+    const paymentProviderId = 'pay_pending_refund_wh_02';
+
+    const validSignature = crypto
+      .createHmac('sha256', testKeySecret)
+      .update(`${orderId}|${paymentProviderId}`)
+      .digest('hex');
+
+    await dispatchRequest(app, 'POST', '/api/v1/tourist/payments/verify', {
+      token: touristToken,
+      body: {
+        paymentId,
+        razorpay_order_id: orderId,
+        razorpay_payment_id: paymentProviderId,
+        razorpay_signature: validSignature,
+      },
+    });
+
+    const refundRes = await dispatchRequest(app, 'POST', `/api/v1/admin/payments/${paymentId}/refund`, {
+      token: adminToken,
+      body: { amountPaise: 500000, reason: 'Failed refund webhook test' },
+    });
+    assert.strictEqual(refundRes.status, 200);
+    const refundRecordId = refundRes.body.data.refund.id;
+    const providerRefundId = refundRes.body.data.refundId;
+
+    const webhookBody = {
+      event: 'refund.failed',
+      payload: {
+        refund: {
+          entity: {
+            id: providerRefundId,
+            payment_id: paymentProviderId,
+            amount: 500000,
+            currency: 'INR',
+            error_code: 'BANK_ACCOUNT_CLOSED',
+            error_description: 'Beneficiary bank account was closed',
+            created_at: Math.floor(Date.now() / 1000),
+          },
+        },
+      },
+    };
+
+    const res = await dispatchWebhook(webhookBody, 'evt_rfnd_fail_01');
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(res.body.data.status, 'PROCESSED');
+
+    // Stored refund is FAILED
+    const storedRefund = testRefundsRepo.inMemoryRefunds.get(refundRecordId)!;
+    assert.strictEqual(storedRefund.status, REFUND_STATUSES.FAILED);
+    assert.strictEqual(storedRefund.failureCode, 'BANK_ACCOUNT_CLOSED');
+
+    // Stored payment released reservation: pending is 0, status is CAPTURED
+    const storedPayment = testPaymentsRepo.inMemoryPayments.get(paymentId)!;
+    assert.strictEqual(storedPayment.status, PAYMENT_STATUSES.CAPTURED);
+    assert.strictEqual(storedPayment.pendingRefundPaise, 0);
+    assert.strictEqual(storedPayment.cumulativeRefundedPaise || 0, 0);
+  });
+
+  it('53. Rejects refund webhook request with invalid HMAC signature', async () => {
+    const webhookBody = {
+      event: 'refund.processed',
+      payload: {
+        refund: {
+          entity: {
+            id: 'rfnd_sig_test_01',
+            amount: 500000,
+          },
+        },
+      },
+    };
+    const res = await dispatchWebhook(webhookBody, 'evt_bad_sig_01', 'bad_signature_digest_0000');
+    assert.strictEqual(res.status, 400);
+    assert.match(res.body.message, /invalid webhook signature/i);
+  });
+
+  it('54. Duplicate refund.processed event with identical event ID is idempotent', async () => {
+    const initRes = await dispatchRequest(app, 'POST', `/api/v1/tourist/bookings/${bookingId}/payments`, {
+      token: touristToken,
+    });
+    const paymentId = initRes.body.data.payment.id;
+    const orderId = initRes.body.data.checkoutData.orderId;
+    const paymentProviderId = 'pay_pending_refund_wh_03';
+
+    const validSignature = crypto
+      .createHmac('sha256', testKeySecret)
+      .update(`${orderId}|${paymentProviderId}`)
+      .digest('hex');
+
+    await dispatchRequest(app, 'POST', '/api/v1/tourist/payments/verify', {
+      token: touristToken,
+      body: {
+        paymentId,
+        razorpay_order_id: orderId,
+        razorpay_payment_id: paymentProviderId,
+        razorpay_signature: validSignature,
+      },
+    });
+
+    const refundRes = await dispatchRequest(app, 'POST', `/api/v1/admin/payments/${paymentId}/refund`, {
+      token: adminToken,
+      body: { amountPaise: 500000, reason: 'Duplicate processed webhook test' },
+    });
+    const providerRefundId = refundRes.body.data.refundId;
+
+    const webhookBody = {
+      event: 'refund.processed',
+      payload: {
+        refund: {
+          entity: {
+            id: providerRefundId,
+            payment_id: paymentProviderId,
+            amount: 500000,
+            currency: 'INR',
+          },
+        },
+      },
+    };
+
+    // First delivery
+    const res1 = await dispatchWebhook(webhookBody, 'evt_dup_proc_test_01');
+    assert.strictEqual(res1.status, 200);
+    assert.strictEqual(res1.body.data.status, 'PROCESSED');
+
+    // Duplicate delivery with identical event ID
+    const res2 = await dispatchWebhook(webhookBody, 'evt_dup_proc_test_01');
+    assert.strictEqual(res2.status, 200);
+    assert.strictEqual(res2.body.data.status, 'ALREADY_PROCESSED');
+
+    // Balance incremented only once
+    const storedPayment = testPaymentsRepo.inMemoryPayments.get(paymentId)!;
+    assert.strictEqual(storedPayment.cumulativeRefundedPaise, 500000);
+  });
+
+  it('55. Duplicate refund.failed event with identical event ID is idempotent', async () => {
+    const initRes = await dispatchRequest(app, 'POST', `/api/v1/tourist/bookings/${bookingId}/payments`, {
+      token: touristToken,
+    });
+    const paymentId = initRes.body.data.payment.id;
+    const orderId = initRes.body.data.checkoutData.orderId;
+    const paymentProviderId = 'pay_pending_refund_wh_04';
+
+    const validSignature = crypto
+      .createHmac('sha256', testKeySecret)
+      .update(`${orderId}|${paymentProviderId}`)
+      .digest('hex');
+
+    await dispatchRequest(app, 'POST', '/api/v1/tourist/payments/verify', {
+      token: touristToken,
+      body: {
+        paymentId,
+        razorpay_order_id: orderId,
+        razorpay_payment_id: paymentProviderId,
+        razorpay_signature: validSignature,
+      },
+    });
+
+    const refundRes = await dispatchRequest(app, 'POST', `/api/v1/admin/payments/${paymentId}/refund`, {
+      token: adminToken,
+      body: { amountPaise: 500000, reason: 'Duplicate failed webhook test' },
+    });
+    const providerRefundId = refundRes.body.data.refundId;
+
+    const webhookBody = {
+      event: 'refund.failed',
+      payload: {
+        refund: {
+          entity: {
+            id: providerRefundId,
+            payment_id: paymentProviderId,
+            amount: 500000,
+            currency: 'INR',
+            error_code: 'GATEWAY_ERROR',
+          },
+        },
+      },
+    };
+
+    const res1 = await dispatchWebhook(webhookBody, 'evt_dup_fail_test_01');
+    assert.strictEqual(res1.status, 200);
+    assert.strictEqual(res1.body.data.status, 'PROCESSED');
+
+    const res2 = await dispatchWebhook(webhookBody, 'evt_dup_fail_test_01');
+    assert.strictEqual(res2.status, 200);
+    assert.strictEqual(res2.body.data.status, 'ALREADY_PROCESSED');
+
+    const storedPayment = testPaymentsRepo.inMemoryPayments.get(paymentId)!;
+    assert.strictEqual(storedPayment.pendingRefundPaise, 0);
+  });
+
+  it('56. refund.processed event arriving after refund was already processed returns ALREADY_PROCESSED', async () => {
+    const initRes = await dispatchRequest(app, 'POST', `/api/v1/tourist/bookings/${bookingId}/payments`, {
+      token: touristToken,
+    });
+    const paymentId = initRes.body.data.payment.id;
+    const orderId = initRes.body.data.checkoutData.orderId;
+    const paymentProviderId = 'pay_sync_refund_wh_05';
+
+    const validSignature = crypto
+      .createHmac('sha256', testKeySecret)
+      .update(`${orderId}|${paymentProviderId}`)
+      .digest('hex');
+
+    await dispatchRequest(app, 'POST', '/api/v1/tourist/payments/verify', {
+      token: touristToken,
+      body: {
+        paymentId,
+        razorpay_order_id: orderId,
+        razorpay_payment_id: paymentProviderId,
+        razorpay_signature: validSignature,
+      },
+    });
+
+    // Synchronous admin refund processes immediately in simulated provider
+    const refundRes = await dispatchRequest(app, 'POST', `/api/v1/admin/payments/${paymentId}/refund`, {
+      token: adminToken,
+      body: { amountPaise: 500000, reason: 'Synchronous refund' },
+    });
+    assert.strictEqual(refundRes.body.data.refund.status, REFUND_STATUSES.PROCESSED);
+    const providerRefundId = refundRes.body.data.refundId;
+
+    // Subsequent webhook arrives with a new event ID
+    const webhookBody = {
+      event: 'refund.processed',
+      payload: {
+        refund: {
+          entity: {
+            id: providerRefundId,
+            payment_id: paymentProviderId,
+            amount: 500000,
+            currency: 'INR',
+          },
+        },
+      },
+    };
+
+    const res = await dispatchWebhook(webhookBody, 'evt_already_proc_wh_01');
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(res.body.data.status, 'ALREADY_PROCESSED');
+
+    // Balance remains 500,000, not doubled
+    const storedPayment = testPaymentsRepo.inMemoryPayments.get(paymentId)!;
+    assert.strictEqual(storedPayment.cumulativeRefundedPaise, 500000);
+  });
+
+  it('57. refund.failed event arriving after refund was already failed returns ALREADY_FAILED', async () => {
+    const initRes = await dispatchRequest(app, 'POST', `/api/v1/tourist/bookings/${bookingId}/payments`, {
+      token: touristToken,
+    });
+    const paymentId = initRes.body.data.payment.id;
+    const orderId = initRes.body.data.checkoutData.orderId;
+    const paymentProviderId = 'pay_pending_refund_wh_06';
+
+    const validSignature = crypto
+      .createHmac('sha256', testKeySecret)
+      .update(`${orderId}|${paymentProviderId}`)
+      .digest('hex');
+
+    await dispatchRequest(app, 'POST', '/api/v1/tourist/payments/verify', {
+      token: touristToken,
+      body: {
+        paymentId,
+        razorpay_order_id: orderId,
+        razorpay_payment_id: paymentProviderId,
+        razorpay_signature: validSignature,
+      },
+    });
+
+    const refundRes = await dispatchRequest(app, 'POST', `/api/v1/admin/payments/${paymentId}/refund`, {
+      token: adminToken,
+      body: { amountPaise: 500000, reason: 'Test already failed' },
+    });
+    const providerRefundId = refundRes.body.data.refundId;
+
+    const webhookBody = {
+      event: 'refund.failed',
+      payload: {
+        refund: {
+          entity: {
+            id: providerRefundId,
+            payment_id: paymentProviderId,
+            amount: 500000,
+            currency: 'INR',
+            error_code: 'BANK_TIMEOUT',
+          },
+        },
+      },
+    };
+
+    // First webhook marks as failed
+    await dispatchWebhook(webhookBody, 'evt_first_fail_01');
+
+    // Second webhook with new event ID detects already FAILED
+    const res2 = await dispatchWebhook(webhookBody, 'evt_second_fail_02');
+    assert.strictEqual(res2.status, 200);
+    assert.strictEqual(res2.body.data.status, 'ALREADY_FAILED');
+  });
+
+  it('58. Conflicting processed and failed events are rejected without corrupting state', async () => {
+    const initRes = await dispatchRequest(app, 'POST', `/api/v1/tourist/bookings/${bookingId}/payments`, {
+      token: touristToken,
+    });
+    const paymentId = initRes.body.data.payment.id;
+    const orderId = initRes.body.data.checkoutData.orderId;
+    const paymentProviderId = 'pay_pending_refund_wh_07';
+
+    const validSignature = crypto
+      .createHmac('sha256', testKeySecret)
+      .update(`${orderId}|${paymentProviderId}`)
+      .digest('hex');
+
+    await dispatchRequest(app, 'POST', '/api/v1/tourist/payments/verify', {
+      token: touristToken,
+      body: {
+        paymentId,
+        razorpay_order_id: orderId,
+        razorpay_payment_id: paymentProviderId,
+        razorpay_signature: validSignature,
+      },
+    });
+
+    const refundRes = await dispatchRequest(app, 'POST', `/api/v1/admin/payments/${paymentId}/refund`, {
+      token: adminToken,
+      body: { amountPaise: 500000, reason: 'Conflict test' },
+    });
+    const providerRefundId = refundRes.body.data.refundId;
+    const refundRecordId = refundRes.body.data.refund.id;
+
+    // Step A: Process the refund
+    const procBody = {
+      event: 'refund.processed',
+      payload: {
+        refund: {
+          entity: {
+            id: providerRefundId,
+            payment_id: paymentProviderId,
+            amount: 500000,
+            currency: 'INR',
+          },
+        },
+      },
+    };
+    await dispatchWebhook(procBody, 'evt_proc_first_01');
+
+    // Step B: Now send conflicting refund.failed for the already PROCESSED refund
+    const failBody = {
+      event: 'refund.failed',
+      payload: {
+        refund: {
+          entity: {
+            id: providerRefundId,
+            payment_id: paymentProviderId,
+            amount: 500000,
+            currency: 'INR',
+            error_code: 'LATE_FAILURE',
+          },
+        },
+      },
+    };
+    const conflictRes = await dispatchWebhook(failBody, 'evt_conflict_fail_01');
+    assert.strictEqual(conflictRes.status, 200);
+    assert.strictEqual(conflictRes.body.data.status, 'CONFLICT');
+
+    // Refund MUST remain PROCESSED, cumulativeRefundedPaise MUST remain 500,000
+    const storedRefund = testRefundsRepo.inMemoryRefunds.get(refundRecordId)!;
+    assert.strictEqual(storedRefund.status, REFUND_STATUSES.PROCESSED);
+    const storedPayment = testPaymentsRepo.inMemoryPayments.get(paymentId)!;
+    assert.strictEqual(storedPayment.cumulativeRefundedPaise, 500000);
+  });
+
+  it('59. Webhook with unknown provider refund ID returns REFUND_NOT_FOUND without mutating balances', async () => {
+    const webhookBody = {
+      event: 'refund.processed',
+      payload: {
+        refund: {
+          entity: {
+            id: 'rfnd_unknown_99999999',
+            payment_id: 'pay_nonexistent_99',
+            amount: 500000,
+            currency: 'INR',
+          },
+        },
+      },
+    };
+
+    const res = await dispatchWebhook(webhookBody, 'evt_unknown_rfnd_01');
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(res.body.data.status, 'REFUND_NOT_FOUND');
+  });
+
+  it('60. Webhook with incorrect provider payment ID returns PAYMENT_MISMATCH', async () => {
+    const initRes = await dispatchRequest(app, 'POST', `/api/v1/tourist/bookings/${bookingId}/payments`, {
+      token: touristToken,
+    });
+    const paymentId = initRes.body.data.payment.id;
+    const orderId = initRes.body.data.checkoutData.orderId;
+    const paymentProviderId = 'pay_pending_refund_wh_08';
+
+    const validSignature = crypto
+      .createHmac('sha256', testKeySecret)
+      .update(`${orderId}|${paymentProviderId}`)
+      .digest('hex');
+
+    await dispatchRequest(app, 'POST', '/api/v1/tourist/payments/verify', {
+      token: touristToken,
+      body: {
+        paymentId,
+        razorpay_order_id: orderId,
+        razorpay_payment_id: paymentProviderId,
+        razorpay_signature: validSignature,
+      },
+    });
+
+    const refundRes = await dispatchRequest(app, 'POST', `/api/v1/admin/payments/${paymentId}/refund`, {
+      token: adminToken,
+      body: { amountPaise: 500000, reason: 'Payment mismatch test' },
+    });
+    const providerRefundId = refundRes.body.data.refundId;
+
+    // Send webhook claiming wrong payment ID
+    const webhookBody = {
+      event: 'refund.processed',
+      payload: {
+        refund: {
+          entity: {
+            id: providerRefundId,
+            payment_id: 'pay_wrong_attacker_id_99',
+            amount: 500000,
+            currency: 'INR',
+          },
+        },
+      },
+    };
+
+    const res = await dispatchWebhook(webhookBody, 'evt_pay_mismatch_01');
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(res.body.data.status, 'PAYMENT_MISMATCH');
+
+    // Balance remains in pending state
+    const storedPayment = testPaymentsRepo.inMemoryPayments.get(paymentId)!;
+    assert.strictEqual(storedPayment.pendingRefundPaise, 500000);
+    assert.strictEqual(storedPayment.cumulativeRefundedPaise || 0, 0);
+  });
+
+  it('61. Webhook with incorrect refund amount returns AMOUNT_MISMATCH', async () => {
+    const initRes = await dispatchRequest(app, 'POST', `/api/v1/tourist/bookings/${bookingId}/payments`, {
+      token: touristToken,
+    });
+    const paymentId = initRes.body.data.payment.id;
+    const orderId = initRes.body.data.checkoutData.orderId;
+    const paymentProviderId = 'pay_pending_refund_wh_09';
+
+    const validSignature = crypto
+      .createHmac('sha256', testKeySecret)
+      .update(`${orderId}|${paymentProviderId}`)
+      .digest('hex');
+
+    await dispatchRequest(app, 'POST', '/api/v1/tourist/payments/verify', {
+      token: touristToken,
+      body: {
+        paymentId,
+        razorpay_order_id: orderId,
+        razorpay_payment_id: paymentProviderId,
+        razorpay_signature: validSignature,
+      },
+    });
+
+    const refundRes = await dispatchRequest(app, 'POST', `/api/v1/admin/payments/${paymentId}/refund`, {
+      token: adminToken,
+      body: { amountPaise: 500000, reason: 'Amount mismatch test' },
+    });
+    const providerRefundId = refundRes.body.data.refundId;
+
+    const webhookBody = {
+      event: 'refund.processed',
+      payload: {
+        refund: {
+          entity: {
+            id: providerRefundId,
+            payment_id: paymentProviderId,
+            amount: 600000, // Tampered amount
+            currency: 'INR',
+          },
+        },
+      },
+    };
+
+    const res = await dispatchWebhook(webhookBody, 'evt_amt_mismatch_01');
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(res.body.data.status, 'AMOUNT_MISMATCH');
+  });
+
+  it('62. Webhook with incorrect currency returns CURRENCY_MISMATCH', async () => {
+    const initRes = await dispatchRequest(app, 'POST', `/api/v1/tourist/bookings/${bookingId}/payments`, {
+      token: touristToken,
+    });
+    const paymentId = initRes.body.data.payment.id;
+    const orderId = initRes.body.data.checkoutData.orderId;
+    const paymentProviderId = 'pay_pending_refund_wh_10';
+
+    const validSignature = crypto
+      .createHmac('sha256', testKeySecret)
+      .update(`${orderId}|${paymentProviderId}`)
+      .digest('hex');
+
+    await dispatchRequest(app, 'POST', '/api/v1/tourist/payments/verify', {
+      token: touristToken,
+      body: {
+        paymentId,
+        razorpay_order_id: orderId,
+        razorpay_payment_id: paymentProviderId,
+        razorpay_signature: validSignature,
+      },
+    });
+
+    const refundRes = await dispatchRequest(app, 'POST', `/api/v1/admin/payments/${paymentId}/refund`, {
+      token: adminToken,
+      body: { amountPaise: 500000, reason: 'Currency mismatch test' },
+    });
+    const providerRefundId = refundRes.body.data.refundId;
+
+    const webhookBody = {
+      event: 'refund.processed',
+      payload: {
+        refund: {
+          entity: {
+            id: providerRefundId,
+            payment_id: paymentProviderId,
+            amount: 500000,
+            currency: 'USD',
+          },
+        },
+      },
+    };
+
+    const res = await dispatchWebhook(webhookBody, 'evt_curr_mismatch_01');
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(res.body.data.status, 'CURRENCY_MISMATCH');
+  });
+
+  it('63. Concurrent duplicate webhook delivery settles balance exactly once', async () => {
+    const initRes = await dispatchRequest(app, 'POST', `/api/v1/tourist/bookings/${bookingId}/payments`, {
+      token: touristToken,
+    });
+    const paymentId = initRes.body.data.payment.id;
+    const orderId = initRes.body.data.checkoutData.orderId;
+    const paymentProviderId = 'pay_pending_refund_wh_11';
+
+    const validSignature = crypto
+      .createHmac('sha256', testKeySecret)
+      .update(`${orderId}|${paymentProviderId}`)
+      .digest('hex');
+
+    await dispatchRequest(app, 'POST', '/api/v1/tourist/payments/verify', {
+      token: touristToken,
+      body: {
+        paymentId,
+        razorpay_order_id: orderId,
+        razorpay_payment_id: paymentProviderId,
+        razorpay_signature: validSignature,
+      },
+    });
+
+    const refundRes = await dispatchRequest(app, 'POST', `/api/v1/admin/payments/${paymentId}/refund`, {
+      token: adminToken,
+      body: { amountPaise: 500000, reason: 'Concurrent webhook test' },
+    });
+    const providerRefundId = refundRes.body.data.refundId;
+
+    const webhookBody = {
+      event: 'refund.processed',
+      payload: {
+        refund: {
+          entity: {
+            id: providerRefundId,
+            payment_id: paymentProviderId,
+            amount: 500000,
+            currency: 'INR',
+          },
+        },
+      },
+    };
+
+    const [resA, resB] = await Promise.all([
+      dispatchWebhook(webhookBody, 'evt_conc_wh_A'),
+      dispatchWebhook(webhookBody, 'evt_conc_wh_B'),
+    ]);
+
+    const statuses = [resA.body.data.status, resB.body.data.status].sort();
+    assert.strictEqual(statuses[0], 'ALREADY_PROCESSED');
+    assert.strictEqual(statuses[1], 'PROCESSED');
+
+    // Stored balance is incremented only once
+    const storedPayment = testPaymentsRepo.inMemoryPayments.get(paymentId)!;
+    assert.strictEqual(storedPayment.cumulativeRefundedPaise, 500000);
+    assert.strictEqual(storedPayment.pendingRefundPaise, 0);
+  });
+
+  it('64. Webhook arriving while synchronous settlement completed returns ALREADY_PROCESSED', async () => {
+    const initRes = await dispatchRequest(app, 'POST', `/api/v1/tourist/bookings/${bookingId}/payments`, {
+      token: touristToken,
+    });
+    const paymentId = initRes.body.data.payment.id;
+    const orderId = initRes.body.data.checkoutData.orderId;
+    const paymentProviderId = 'pay_sync_settle_wh_12';
+
+    const validSignature = crypto
+      .createHmac('sha256', testKeySecret)
+      .update(`${orderId}|${paymentProviderId}`)
+      .digest('hex');
+
+    await dispatchRequest(app, 'POST', '/api/v1/tourist/payments/verify', {
+      token: touristToken,
+      body: {
+        paymentId,
+        razorpay_order_id: orderId,
+        razorpay_payment_id: paymentProviderId,
+        razorpay_signature: validSignature,
+      },
+    });
+
+    const refundRes = await dispatchRequest(app, 'POST', `/api/v1/admin/payments/${paymentId}/refund`, {
+      token: adminToken,
+      body: { amountPaise: 500000, reason: 'Sync race test' },
+    });
+    const providerRefundId = refundRes.body.data.refundId;
+
+    const webhookBody = {
+      event: 'refund.processed',
+      payload: {
+        refund: {
+          entity: {
+            id: providerRefundId,
+            payment_id: paymentProviderId,
+            amount: 500000,
+            currency: 'INR',
+          },
+        },
+      },
+    };
+
+    const res = await dispatchWebhook(webhookBody, 'evt_sync_race_01');
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(res.body.data.status, 'ALREADY_PROCESSED');
+
+    const storedPayment = testPaymentsRepo.inMemoryPayments.get(paymentId)!;
+    assert.strictEqual(storedPayment.cumulativeRefundedPaise, 500000);
+  });
+
+  it('65. Database failure during settlement updates webhook to FAILED and returns 500', async () => {
+    const initRes = await dispatchRequest(app, 'POST', `/api/v1/tourist/bookings/${bookingId}/payments`, {
+      token: touristToken,
+    });
+    const paymentId = initRes.body.data.payment.id;
+    const orderId = initRes.body.data.checkoutData.orderId;
+    const paymentProviderId = 'pay_pending_refund_wh_13';
+
+    const validSignature = crypto
+      .createHmac('sha256', testKeySecret)
+      .update(`${orderId}|${paymentProviderId}`)
+      .digest('hex');
+
+    await dispatchRequest(app, 'POST', '/api/v1/tourist/payments/verify', {
+      token: touristToken,
+      body: {
+        paymentId,
+        razorpay_order_id: orderId,
+        razorpay_payment_id: paymentProviderId,
+        razorpay_signature: validSignature,
+      },
+    });
+
+    const refundRes = await dispatchRequest(app, 'POST', `/api/v1/admin/payments/${paymentId}/refund`, {
+      token: adminToken,
+      body: { amountPaise: 500000, reason: 'DB failure settlement test' },
+    });
+    const providerRefundId = refundRes.body.data.refundId;
+
+    // Stub settleRefundBalance to throw DB error
+    const origSettle = testPaymentsRepo.settleRefundBalance.bind(testPaymentsRepo);
+    testPaymentsRepo.settleRefundBalance = async () => {
+      throw new InternalServerError('Simulated database connection loss during settlement', 'DB_CONNECTION_ERROR');
+    };
+
+    try {
+      const webhookBody = {
+        event: 'refund.processed',
+        payload: {
+          refund: {
+            entity: {
+              id: providerRefundId,
+              payment_id: paymentProviderId,
+              amount: 500000,
+              currency: 'INR',
+            },
+          },
+        },
+      };
+
+      const res = await dispatchWebhook(webhookBody, 'evt_db_fail_settle_01');
+      assert.strictEqual(res.status, 500);
+      assert.strictEqual(res.body.error.code, 'INTERNAL_SERVER_ERROR');
+
+      const webhookEvent = await testPaymentsRepo.findWebhookEvent(PAYMENT_PROVIDERS.RAZORPAY, 'evt_db_fail_settle_01');
+      assert.strictEqual(webhookEvent?.processingStatus, PAYMENT_WEBHOOK_STATUSES.FAILED);
+    } finally {
+      testPaymentsRepo.settleRefundBalance = origSettle;
+    }
+  });
+
+  it('66. Database failure during release updates webhook to FAILED and returns 500', async () => {
+    const initRes = await dispatchRequest(app, 'POST', `/api/v1/tourist/bookings/${bookingId}/payments`, {
+      token: touristToken,
+    });
+    const paymentId = initRes.body.data.payment.id;
+    const orderId = initRes.body.data.checkoutData.orderId;
+    const paymentProviderId = 'pay_pending_refund_wh_14';
+
+    const validSignature = crypto
+      .createHmac('sha256', testKeySecret)
+      .update(`${orderId}|${paymentProviderId}`)
+      .digest('hex');
+
+    await dispatchRequest(app, 'POST', '/api/v1/tourist/payments/verify', {
+      token: touristToken,
+      body: {
+        paymentId,
+        razorpay_order_id: orderId,
+        razorpay_payment_id: paymentProviderId,
+        razorpay_signature: validSignature,
+      },
+    });
+
+    const refundRes = await dispatchRequest(app, 'POST', `/api/v1/admin/payments/${paymentId}/refund`, {
+      token: adminToken,
+      body: { amountPaise: 500000, reason: 'DB failure release test' },
+    });
+    const providerRefundId = refundRes.body.data.refundId;
+
+    // Stub releaseRefundBalance to throw DB error
+    const origRelease = testPaymentsRepo.releaseRefundBalance.bind(testPaymentsRepo);
+    testPaymentsRepo.releaseRefundBalance = async () => {
+      throw new InternalServerError('Simulated database connection loss during release', 'DB_CONNECTION_ERROR');
+    };
+
+    try {
+      const webhookBody = {
+        event: 'refund.failed',
+        payload: {
+          refund: {
+            entity: {
+              id: providerRefundId,
+              payment_id: paymentProviderId,
+              amount: 500000,
+              currency: 'INR',
+              error_code: 'BANK_REJECTED',
+            },
+          },
+        },
+      };
+
+      const res = await dispatchWebhook(webhookBody, 'evt_db_fail_release_01');
+      assert.strictEqual(res.status, 500);
+      assert.strictEqual(res.body.error.code, 'INTERNAL_SERVER_ERROR');
+
+      const webhookEvent = await testPaymentsRepo.findWebhookEvent(PAYMENT_PROVIDERS.RAZORPAY, 'evt_db_fail_release_01');
+      assert.strictEqual(webhookEvent?.processingStatus, PAYMENT_WEBHOOK_STATUSES.FAILED);
+    } finally {
+      testPaymentsRepo.releaseRefundBalance = origRelease;
+    }
+  });
+
+  it('67. Partial refund webhook keeps payment CAPTURED and booking CONFIRMED', async () => {
+    const initRes = await dispatchRequest(app, 'POST', `/api/v1/tourist/bookings/${bookingId}/payments`, {
+      token: touristToken,
+    });
+    const paymentId = initRes.body.data.payment.id;
+    const orderId = initRes.body.data.checkoutData.orderId;
+    const paymentProviderId = 'pay_pending_refund_wh_15';
+
+    const validSignature = crypto
+      .createHmac('sha256', testKeySecret)
+      .update(`${orderId}|${paymentProviderId}`)
+      .digest('hex');
+
+    await dispatchRequest(app, 'POST', '/api/v1/tourist/payments/verify', {
+      token: touristToken,
+      body: {
+        paymentId,
+        razorpay_order_id: orderId,
+        razorpay_payment_id: paymentProviderId,
+        razorpay_signature: validSignature,
+      },
+    });
+
+    const refundRes = await dispatchRequest(app, 'POST', `/api/v1/admin/payments/${paymentId}/refund`, {
+      token: adminToken,
+      body: { amountPaise: 500000, reason: 'Partial refund webhook test' },
+    });
+    const providerRefundId = refundRes.body.data.refundId;
+
+    const webhookBody = {
+      event: 'refund.processed',
+      payload: {
+        refund: {
+          entity: {
+            id: providerRefundId,
+            payment_id: paymentProviderId,
+            amount: 500000,
+            currency: 'INR',
+          },
+        },
+      },
+    };
+
+    const res = await dispatchWebhook(webhookBody, 'evt_partial_wh_01');
+    assert.strictEqual(res.status, 200);
+
+    const storedPayment = testPaymentsRepo.inMemoryPayments.get(paymentId)!;
+    assert.strictEqual(storedPayment.status, PAYMENT_STATUSES.CAPTURED);
+    assert.strictEqual(storedPayment.cumulativeRefundedPaise, 500000);
+    assert.strictEqual(storedPayment.reconciliationStatus, 'PARTIALLY_REFUNDED');
+
+    const storedBooking = testBookingsRepo.inMemoryBookings.get(bookingId.toString())!;
+    assert.strictEqual(storedBooking.status, BOOKING_STATUSES.CONFIRMED);
+  });
+
+  it('68. Full refund webhook transitions payment to REFUNDED and booking to CANCELLED', async () => {
+    const initRes = await dispatchRequest(app, 'POST', `/api/v1/tourist/bookings/${bookingId}/payments`, {
+      token: touristToken,
+    });
+    const paymentId = initRes.body.data.payment.id;
+    const orderId = initRes.body.data.checkoutData.orderId;
+    const paymentProviderId = 'pay_pending_refund_wh_16';
+
+    const validSignature = crypto
+      .createHmac('sha256', testKeySecret)
+      .update(`${orderId}|${paymentProviderId}`)
+      .digest('hex');
+
+    await dispatchRequest(app, 'POST', '/api/v1/tourist/payments/verify', {
+      token: touristToken,
+      body: {
+        paymentId,
+        razorpay_order_id: orderId,
+        razorpay_payment_id: paymentProviderId,
+        razorpay_signature: validSignature,
+      },
+    });
+
+    // Full refund: 1,500,000 paise
+    const refundRes = await dispatchRequest(app, 'POST', `/api/v1/admin/payments/${paymentId}/refund`, {
+      token: adminToken,
+      body: { amountPaise: 1500000, reason: 'Full refund webhook test' },
+    });
+    const providerRefundId = refundRes.body.data.refundId;
+
+    const webhookBody = {
+      event: 'refund.processed',
+      payload: {
+        refund: {
+          entity: {
+            id: providerRefundId,
+            payment_id: paymentProviderId,
+            amount: 1500000,
+            currency: 'INR',
+          },
+        },
+      },
+    };
+
+    const res = await dispatchWebhook(webhookBody, 'evt_full_wh_01');
+    assert.strictEqual(res.status, 200);
+
+    const storedPayment = testPaymentsRepo.inMemoryPayments.get(paymentId)!;
+    assert.strictEqual(storedPayment.status, PAYMENT_STATUSES.REFUNDED);
+    assert.strictEqual(storedPayment.cumulativeRefundedPaise, 1500000);
+    assert.strictEqual(storedPayment.reconciliationStatus, 'REFUNDED');
+
+    const storedBooking = testBookingsRepo.inMemoryBookings.get(bookingId.toString())!;
+    assert.strictEqual(storedBooking.status, BOOKING_STATUSES.CANCELLED);
+  });
+
+  it('69. Full refund webhook on late payment with expired hold does NOT restore inventory twice', async () => {
+    const initRes = await dispatchRequest(app, 'POST', `/api/v1/tourist/bookings/${bookingId}/payments`, {
+      token: touristToken,
+    });
+    const paymentId = initRes.body.data.payment.id;
+    const orderId = initRes.body.data.checkoutData.orderId;
+    const paymentProviderId = 'pay_pending_refund_wh_17';
+
+    // Hold expired before verification -> late payment
+    const hold = testBookingsRepo.inMemoryHolds.get(holdId.toString())!;
+    hold.status = INVENTORY_HOLD_STATUSES.EXPIRED;
+    hold.expiresAt = new Date(Date.now() - 5000);
+
+    for (const dateStr of stayDates) {
+      const inv = testRoomRepo.inMemoryInventory.get(`${roomTypeId.toString()}:${dateStr}`)!;
+      inv.availableUnits = 5;
+    }
+
+    const validSignature = crypto
+      .createHmac('sha256', testKeySecret)
+      .update(`${orderId}|${paymentProviderId}`)
+      .digest('hex');
+
+    await dispatchRequest(app, 'POST', '/api/v1/tourist/payments/verify', {
+      token: touristToken,
+      body: {
+        paymentId,
+        razorpay_order_id: orderId,
+        razorpay_payment_id: paymentProviderId,
+        razorpay_signature: validSignature,
+      },
+    });
+
+    const refundRes = await dispatchRequest(app, 'POST', `/api/v1/admin/payments/${paymentId}/refund`, {
+      token: adminToken,
+      body: { amountPaise: 1500000, reason: 'Late payment full refund' },
+    });
+    const providerRefundId = refundRes.body.data.refundId;
+
+    const webhookBody = {
+      event: 'refund.processed',
+      payload: {
+        refund: {
+          entity: {
+            id: providerRefundId,
+            payment_id: paymentProviderId,
+            amount: 1500000,
+            currency: 'INR',
+          },
+        },
+      },
+    };
+
+    const res = await dispatchWebhook(webhookBody, 'evt_late_wh_full_01');
+    assert.strictEqual(res.status, 200);
+
+    // CRITICAL SECURITY ASSERTION: Available units must remain exactly 5, NOT 6!
+    for (const dateStr of stayDates) {
+      const inv = testRoomRepo.inMemoryInventory.get(`${roomTypeId.toString()}:${dateStr}`)!;
+      assert.strictEqual(inv.availableUnits, 5, `Inventory on ${dateStr} was incremented beyond initial capacity!`);
+    }
+  });
+
+  it('70. Webhook with duplicate event ID delivered three times processes once and deduplicates subsequent deliveries', async () => {
+    const initRes = await dispatchRequest(app, 'POST', `/api/v1/tourist/bookings/${bookingId}/payments`, {
+      token: touristToken,
+    });
+    const paymentId = initRes.body.data.payment.id;
+    const orderId = initRes.body.data.checkoutData.orderId;
+    const paymentProviderId = 'pay_pending_refund_wh_18';
+
+    const validSignature = crypto
+      .createHmac('sha256', testKeySecret)
+      .update(`${orderId}|${paymentProviderId}`)
+      .digest('hex');
+
+    await dispatchRequest(app, 'POST', '/api/v1/tourist/payments/verify', {
+      token: touristToken,
+      body: {
+        paymentId,
+        razorpay_order_id: orderId,
+        razorpay_payment_id: paymentProviderId,
+        razorpay_signature: validSignature,
+      },
+    });
+
+    const refundRes = await dispatchRequest(app, 'POST', `/api/v1/admin/payments/${paymentId}/refund`, {
+      token: adminToken,
+      body: { amountPaise: 500000, reason: 'Triple delivery test' },
+    });
+    const providerRefundId = refundRes.body.data.refundId;
+
+    const webhookBody = {
+      event: 'refund.processed',
+      payload: {
+        refund: {
+          entity: {
+            id: providerRefundId,
+            payment_id: paymentProviderId,
+            amount: 500000,
+            currency: 'INR',
+          },
+        },
+      },
+    };
+
+    const eventId = 'evt_triple_delivery_test_99';
+    const res1 = await dispatchWebhook(webhookBody, eventId);
+    assert.strictEqual(res1.status, 200);
+    assert.strictEqual(res1.body.data.status, 'PROCESSED');
+
+    const res2 = await dispatchWebhook(webhookBody, eventId);
+    assert.strictEqual(res2.status, 200);
+    assert.strictEqual(res2.body.data.status, 'ALREADY_PROCESSED');
+
+    const res3 = await dispatchWebhook(webhookBody, eventId);
+    assert.strictEqual(res3.status, 200);
+    assert.strictEqual(res3.body.data.status, 'ALREADY_PROCESSED');
+
+    const storedPayment = testPaymentsRepo.inMemoryPayments.get(paymentId)!;
+    assert.strictEqual(storedPayment.cumulativeRefundedPaise, 500000);
   });
 });

@@ -194,6 +194,48 @@ export class RefundsRepository {
       .exec();
   }
 
+  public async transitionRefundStatus(
+    id: string | Types.ObjectId,
+    allowedStatuses: RefundStatus[],
+    targetStatus: RefundStatus,
+    updateData: Partial<IRefundLean> = {},
+    session?: ClientSession,
+  ): Promise<IRefundLean | null> {
+    const idStr = id.toString();
+    const now = new Date();
+
+    if (mongoose.connection.readyState === 0) {
+      const r = this.inMemoryRefunds.get(idStr);
+      if (!r) return null;
+      if (!allowedStatuses.includes(r.status)) return null;
+      const updated: IRefundLean = {
+        ...r,
+        ...updateData,
+        status: targetStatus,
+        updatedAt: now,
+      };
+      this.inMemoryRefunds.set(idStr, updated);
+      return updated;
+    }
+
+    return RefundModel.findOneAndUpdate(
+      {
+        _id: new Types.ObjectId(idStr),
+        status: { $in: allowedStatuses },
+      },
+      {
+        $set: {
+          ...updateData,
+          status: targetStatus,
+          updatedAt: now,
+        },
+      },
+      { new: true, session },
+    )
+      .lean<IRefundLean>()
+      .exec();
+  }
+
   public async calculatePaymentRefundTotals(
     paymentId: string | Types.ObjectId,
   ): Promise<{ cumulativeRefundedPaise: number; pendingRefundPaise: number }> {
