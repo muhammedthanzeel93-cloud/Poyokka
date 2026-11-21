@@ -13,6 +13,8 @@ import {
   BOOKING_STATUSES,
   INVENTORY_HOLD_STATUSES,
   PAYMENT_STATUSES,
+  REFUND_STATUSES,
+  NOTIFICATION_TYPES,
   ADMIN_AUDIT_ACTIONS,
   ADMIN_PERMISSIONS,
 } from '@kerala-tourism/constants';
@@ -30,6 +32,8 @@ import { RoomRepository } from '../modules/rooms/room.repository';
 import { BookingsRepository } from '../modules/bookings/bookings.repository';
 import { bookingsService } from '../modules/bookings/bookings.service';
 import { PaymentsRepository } from '../modules/payments/payments.repository';
+import { RefundsRepository } from '../modules/payments/refund.repository';
+import { NotificationService } from '../modules/notifications/notification.service';
 import { paymentsService } from '../modules/payments/payments.service';
 import { webhookService } from '../modules/payments/webhook.service';
 import { RazorpayPaymentProvider } from '../modules/payments/providers/razorpay.provider';
@@ -126,14 +130,25 @@ class MockAuditService extends AuditLogService {
   }
 }
 
+class MockNotificationService extends NotificationService {
+  public publishedEvents: any[] = [];
+
+  public async publishEvent(input: any): Promise<any> {
+    this.publishedEvents.push(input);
+    return { success: true };
+  }
+}
+
 describe('DAY 24 — Payment Integration, Payment Lifecycle & Webhook Security', () => {
   let app: any;
   let testAuthRepo: TestAuthRepository;
   let mockAudit: MockAuditService;
+  let mockNotif: MockNotificationService;
   let testBookingsRepo: BookingsRepository;
   let testRoomRepo: RoomRepository;
   let testPropRepo: PropertyRepository;
   let testPaymentsRepo: PaymentsRepository;
+  let testRefundsRepo: RefundsRepository;
   let testProvider: RazorpayPaymentProvider;
 
   const testKeySecret = 'test_secret_key_32chars_minimum_length';
@@ -192,10 +207,12 @@ describe('DAY 24 — Payment Integration, Payment Lifecycle & Webhook Security',
     resetRateLimiter();
     testAuthRepo = new TestAuthRepository();
     mockAudit = new MockAuditService();
+    mockNotif = new MockNotificationService();
     testBookingsRepo = new BookingsRepository();
     testRoomRepo = new RoomRepository();
     testPropRepo = new PropertyRepository();
     testPaymentsRepo = new PaymentsRepository();
+    testRefundsRepo = new RefundsRepository();
     testProvider = new RazorpayPaymentProvider(
       'rzp_test_mock_key_id',
       testKeySecret,
@@ -216,10 +233,12 @@ describe('DAY 24 — Payment Integration, Payment Lifecycle & Webhook Security',
 
     // Wire payments service & webhook service
     paymentsService.setRepository(testPaymentsRepo);
+    paymentsService.setRefundsRepository(testRefundsRepo);
     paymentsService.setBookingsRepository(testBookingsRepo);
     paymentsService.setPropertyRepository(testPropRepo);
     paymentsService.setProvider(testProvider);
     paymentsService.setAuditService(mockAudit);
+    paymentsService.setNotificationService(mockNotif);
 
     webhookService.setRepository(testPaymentsRepo);
     webhookService.setProvider(testProvider);
@@ -1530,5 +1549,528 @@ describe('DAY 24 — Payment Integration, Payment Lifecycle & Webhook Security',
     });
     assert.strictEqual(listRes.status, 200);
     assert.ok(listRes.body.data.payments.length >= 1);
+  });
+
+  it('39. Rejects refund request when payment record lacks providerPaymentId (400 MISSING_PROVIDER_PAYMENT_ID)', async () => {
+    const initRes = await dispatchRequest(app, 'POST', `/api/v1/tourist/bookings/${bookingId}/payments`, {
+      token: touristToken,
+    });
+    const paymentId = initRes.body.data.payment.id;
+    const orderId = initRes.body.data.checkoutData.orderId;
+    const paymentProviderId = 'pay_missing_provider_01';
+
+    const validSignature = crypto
+      .createHmac('sha256', testKeySecret)
+      .update(`${orderId}|${paymentProviderId}`)
+      .digest('hex');
+
+    await dispatchRequest(app, 'POST', '/api/v1/tourist/payments/verify', {
+      token: touristToken,
+      body: {
+        paymentId,
+        razorpay_order_id: orderId,
+        razorpay_payment_id: paymentProviderId,
+        razorpay_signature: validSignature,
+      },
+    });
+
+    // Manually simulate a corrupt/missing providerPaymentId on captured payment
+    const stored = testPaymentsRepo.inMemoryPayments.get(paymentId)!;
+    stored.providerPaymentId = null as any;
+
+    const res = await dispatchRequest(app, 'POST', `/api/v1/admin/payments/${paymentId}/refund`, {
+      token: adminToken,
+      body: { reason: 'Refund attempt with missing provider ID' },
+    });
+
+    assert.strictEqual(res.status, 400);
+    assert.strictEqual(res.body.error.code, 'MISSING_PROVIDER_PAYMENT_ID');
+  });
+
+  it('40. Successfully processes partial refund, keeps payment in CAPTURED status, and decrements remaining balance', async () => {
+    const initRes = await dispatchRequest(app, 'POST', `/api/v1/tourist/bookings/${bookingId}/payments`, {
+      token: touristToken,
+    });
+    const paymentId = initRes.body.data.payment.id;
+    const orderId = initRes.body.data.checkoutData.orderId;
+    const paymentProviderId = 'pay_partial_refund_01';
+
+    const validSignature = crypto
+      .createHmac('sha256', testKeySecret)
+      .update(`${orderId}|${paymentProviderId}`)
+      .digest('hex');
+
+    await dispatchRequest(app, 'POST', '/api/v1/tourist/payments/verify', {
+      token: touristToken,
+      body: {
+        paymentId,
+        razorpay_order_id: orderId,
+        razorpay_payment_id: paymentProviderId,
+        razorpay_signature: validSignature,
+      },
+    });
+
+    // Request partial refund of 500,000 paise (5,000 INR) out of 1,500,000 paise (15,000 INR)
+    const res = await dispatchRequest(app, 'POST', `/api/v1/admin/payments/${paymentId}/refund`, {
+      token: adminToken,
+      body: {
+        amountPaise: 500000,
+        reason: 'Partial goodwill refund for room inconvenience',
+      },
+    });
+
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(res.body.success, true);
+    assert.strictEqual(res.body.data.refund.amountPaise, 500000);
+    assert.strictEqual(res.body.data.refund.status, REFUND_STATUSES.PROCESSED);
+    assert.strictEqual(res.body.data.payment.status, PAYMENT_STATUSES.CAPTURED);
+    assert.strictEqual(res.body.data.payment.cumulativeRefundedPaise, 500000);
+    assert.strictEqual(res.body.data.remainingRefundablePaise, 1000000);
+
+    // Stored payment verified
+    const stored = testPaymentsRepo.inMemoryPayments.get(paymentId)!;
+    assert.strictEqual(stored.status, PAYMENT_STATUSES.CAPTURED);
+    assert.strictEqual(stored.cumulativeRefundedPaise, 500000);
+    assert.strictEqual(stored.reconciliationStatus, 'PARTIALLY_REFUNDED');
+
+    // Associated booking remains CONFIRMED because not fully refunded
+    const storedBooking = testBookingsRepo.inMemoryBookings.get(bookingId.toString())!;
+    assert.strictEqual(storedBooking.status, BOOKING_STATUSES.CONFIRMED);
+  });
+
+  it('41. Rejects second partial refund when sum of partial refunds exceeds total captured amount', async () => {
+    const initRes = await dispatchRequest(app, 'POST', `/api/v1/tourist/bookings/${bookingId}/payments`, {
+      token: touristToken,
+    });
+    const paymentId = initRes.body.data.payment.id;
+    const orderId = initRes.body.data.checkoutData.orderId;
+    const paymentProviderId = 'pay_cumul_refund_01';
+
+    const validSignature = crypto
+      .createHmac('sha256', testKeySecret)
+      .update(`${orderId}|${paymentProviderId}`)
+      .digest('hex');
+
+    await dispatchRequest(app, 'POST', '/api/v1/tourist/payments/verify', {
+      token: touristToken,
+      body: {
+        paymentId,
+        razorpay_order_id: orderId,
+        razorpay_payment_id: paymentProviderId,
+        razorpay_signature: validSignature,
+      },
+    });
+
+    // First partial refund of 1,000,000 paise (leaving 500,000 paise)
+    const firstRes = await dispatchRequest(app, 'POST', `/api/v1/admin/payments/${paymentId}/refund`, {
+      token: adminToken,
+      body: {
+        amountPaise: 1000000,
+        reason: 'First partial refund',
+      },
+    });
+    assert.strictEqual(firstRes.status, 200);
+
+    // Second partial refund of 600,000 paise exceeds remaining 500,000 paise
+    const secondRes = await dispatchRequest(app, 'POST', `/api/v1/admin/payments/${paymentId}/refund`, {
+      token: adminToken,
+      body: {
+        amountPaise: 600000,
+        reason: 'Excess second partial refund',
+      },
+    });
+    assert.strictEqual(secondRes.status, 400);
+    assert.strictEqual(secondRes.body.error.code, 'INVALID_REFUND_AMOUNT');
+  });
+
+  it('42. Duplicate idempotencyKey returns existing refund without second provider call (idempotent replay)', async () => {
+    const initRes = await dispatchRequest(app, 'POST', `/api/v1/tourist/bookings/${bookingId}/payments`, {
+      token: touristToken,
+    });
+    const paymentId = initRes.body.data.payment.id;
+    const orderId = initRes.body.data.checkoutData.orderId;
+    const paymentProviderId = 'pay_idemp_refund_01';
+
+    const validSignature = crypto
+      .createHmac('sha256', testKeySecret)
+      .update(`${orderId}|${paymentProviderId}`)
+      .digest('hex');
+
+    await dispatchRequest(app, 'POST', '/api/v1/tourist/payments/verify', {
+      token: touristToken,
+      body: {
+        paymentId,
+        razorpay_order_id: orderId,
+        razorpay_payment_id: paymentProviderId,
+        razorpay_signature: validSignature,
+      },
+    });
+
+    const idempotencyKey = 'idemp_key_unique_test_12345';
+
+    // First refund with idempotencyKey
+    const firstRes = await dispatchRequest(app, 'POST', `/api/v1/admin/payments/${paymentId}/refund`, {
+      token: adminToken,
+      body: {
+        amountPaise: 300000,
+        reason: 'First call with key',
+        idempotencyKey,
+      },
+    });
+    assert.strictEqual(firstRes.status, 200);
+    const firstRefundId = firstRes.body.data.refund.id;
+
+    // Second refund with the exact same idempotencyKey
+    const secondRes = await dispatchRequest(app, 'POST', `/api/v1/admin/payments/${paymentId}/refund`, {
+      token: adminToken,
+      body: {
+        amountPaise: 300000,
+        reason: 'Duplicate call with same key',
+        idempotencyKey,
+      },
+    });
+    assert.strictEqual(secondRes.status, 200);
+    assert.strictEqual(secondRes.body.data.refund.id, firstRefundId);
+    assert.ok(
+      secondRes.body.message.includes('idempotent replay') ||
+      secondRes.body.data.message.includes('idempotent replay'),
+    );
+
+    // Check that only 1 refund record exists for this key
+    const allRefunds = Array.from(testRefundsRepo.inMemoryRefunds.values());
+    const matchingRefunds = allRefunds.filter((r) => r.idempotencyKey === idempotencyKey);
+    assert.strictEqual(matchingRefunds.length, 1);
+  });
+
+  it('43. Rejects concurrent refund requests when cumulative amount exceeds refundable balance', async () => {
+    const initRes = await dispatchRequest(app, 'POST', `/api/v1/tourist/bookings/${bookingId}/payments`, {
+      token: touristToken,
+    });
+    const paymentId = initRes.body.data.payment.id;
+    const orderId = initRes.body.data.checkoutData.orderId;
+    const paymentProviderId = 'pay_concurrent_refund_01';
+
+    const validSignature = crypto
+      .createHmac('sha256', testKeySecret)
+      .update(`${orderId}|${paymentProviderId}`)
+      .digest('hex');
+
+    await dispatchRequest(app, 'POST', '/api/v1/tourist/payments/verify', {
+      token: touristToken,
+      body: {
+        paymentId,
+        razorpay_order_id: orderId,
+        razorpay_payment_id: paymentProviderId,
+        razorpay_signature: validSignature,
+      },
+    });
+
+    // Fire 2 concurrent refund requests for 1,000,000 paise each on 1,500,000 paise balance
+    const [res1, res2] = await Promise.all([
+      dispatchRequest(app, 'POST', `/api/v1/admin/payments/${paymentId}/refund`, {
+        token: adminToken,
+        body: { amountPaise: 1000000, reason: 'Concurrent request 1', idempotencyKey: 'concurrent_1' },
+      }),
+      dispatchRequest(app, 'POST', `/api/v1/admin/payments/${paymentId}/refund`, {
+        token: adminToken,
+        body: { amountPaise: 1000000, reason: 'Concurrent request 2', idempotencyKey: 'concurrent_2' },
+      }),
+    ]);
+
+    const statuses = [res1.status, res2.status].sort();
+    assert.strictEqual(statuses[0], 200);
+    assert.ok(
+      [400, 409].includes(statuses[1]),
+      `Expected concurrent failure status to be 400 or 409, got ${statuses[1]}`,
+    );
+  });
+
+  it('44. Preserves REFUND_PENDING payment status when provider returns pending', async () => {
+    const initRes = await dispatchRequest(app, 'POST', `/api/v1/tourist/bookings/${bookingId}/payments`, {
+      token: touristToken,
+    });
+    const paymentId = initRes.body.data.payment.id;
+    const orderId = initRes.body.data.checkoutData.orderId;
+    const paymentProviderId = 'pay_pending_refund_gateway_01';
+
+    const validSignature = crypto
+      .createHmac('sha256', testKeySecret)
+      .update(`${orderId}|${paymentProviderId}`)
+      .digest('hex');
+
+    await dispatchRequest(app, 'POST', '/api/v1/tourist/payments/verify', {
+      token: touristToken,
+      body: {
+        paymentId,
+        razorpay_order_id: orderId,
+        razorpay_payment_id: paymentProviderId,
+        razorpay_signature: validSignature,
+      },
+    });
+
+    const res = await dispatchRequest(app, 'POST', `/api/v1/admin/payments/${paymentId}/refund`, {
+      token: adminToken,
+      body: { amountPaise: 500000, reason: 'Pending gateway settlement refund' },
+    });
+
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(res.body.data.refund.status, REFUND_STATUSES.PENDING);
+    assert.strictEqual(res.body.data.payment.status, PAYMENT_STATUSES.REFUND_PENDING);
+
+    const stored = testPaymentsRepo.inMemoryPayments.get(paymentId)!;
+    assert.strictEqual(stored.status, PAYMENT_STATUSES.REFUND_PENDING);
+    assert.strictEqual(stored.pendingRefundPaise, 500000);
+  });
+
+  it('45. Releases reserved balance and preserves CAPTURED status when provider refund fails', async () => {
+    const initRes = await dispatchRequest(app, 'POST', `/api/v1/tourist/bookings/${bookingId}/payments`, {
+      token: touristToken,
+    });
+    const paymentId = initRes.body.data.payment.id;
+    const orderId = initRes.body.data.checkoutData.orderId;
+    const paymentProviderId = 'pay_fail_refund_gateway_01';
+
+    const validSignature = crypto
+      .createHmac('sha256', testKeySecret)
+      .update(`${orderId}|${paymentProviderId}`)
+      .digest('hex');
+
+    await dispatchRequest(app, 'POST', '/api/v1/tourist/payments/verify', {
+      token: touristToken,
+      body: {
+        paymentId,
+        razorpay_order_id: orderId,
+        razorpay_payment_id: paymentProviderId,
+        razorpay_signature: validSignature,
+      },
+    });
+
+    const res = await dispatchRequest(app, 'POST', `/api/v1/admin/payments/${paymentId}/refund`, {
+      token: adminToken,
+      body: { amountPaise: 500000, reason: 'Failing refund test' },
+    });
+
+    assert.strictEqual(res.status, 502);
+    assert.strictEqual(res.body.error.code, 'PAYMENT_GATEWAY_ERROR');
+
+    const stored = testPaymentsRepo.inMemoryPayments.get(paymentId)!;
+    assert.strictEqual(stored.status, PAYMENT_STATUSES.CAPTURED);
+    assert.strictEqual(stored.pendingRefundPaise, 0);
+    assert.strictEqual(stored.cumulativeRefundedPaise || 0, 0);
+  });
+
+  it('46. Preserves REFUND_PENDING status and reserved balance upon provider network timeout without double refund', async () => {
+    const initRes = await dispatchRequest(app, 'POST', `/api/v1/tourist/bookings/${bookingId}/payments`, {
+      token: touristToken,
+    });
+    const paymentId = initRes.body.data.payment.id;
+    const orderId = initRes.body.data.checkoutData.orderId;
+    const paymentProviderId = 'pay_timeout_refund_gateway_01';
+
+    const validSignature = crypto
+      .createHmac('sha256', testKeySecret)
+      .update(`${orderId}|${paymentProviderId}`)
+      .digest('hex');
+
+    await dispatchRequest(app, 'POST', '/api/v1/tourist/payments/verify', {
+      token: touristToken,
+      body: {
+        paymentId,
+        razorpay_order_id: orderId,
+        razorpay_payment_id: paymentProviderId,
+        razorpay_signature: validSignature,
+      },
+    });
+
+    const res = await dispatchRequest(app, 'POST', `/api/v1/admin/payments/${paymentId}/refund`, {
+      token: adminToken,
+      body: { amountPaise: 500000, reason: 'Timeout refund test' },
+    });
+
+    assert.strictEqual(res.status, 502);
+    assert.strictEqual(res.body.error.code, 'PAYMENT_GATEWAY_TIMEOUT');
+
+    const stored = testPaymentsRepo.inMemoryPayments.get(paymentId)!;
+    assert.strictEqual(stored.status, PAYMENT_STATUSES.REFUND_PENDING);
+    assert.strictEqual(stored.pendingRefundPaise, 500000);
+  });
+
+  it('47. Dispatches guest notification and records immutable audit log for refund', async () => {
+    const initRes = await dispatchRequest(app, 'POST', `/api/v1/tourist/bookings/${bookingId}/payments`, {
+      token: touristToken,
+    });
+    const paymentId = initRes.body.data.payment.id;
+    const orderId = initRes.body.data.checkoutData.orderId;
+    const paymentProviderId = 'pay_notif_audit_refund_01';
+
+    const validSignature = crypto
+      .createHmac('sha256', testKeySecret)
+      .update(`${orderId}|${paymentProviderId}`)
+      .digest('hex');
+
+    await dispatchRequest(app, 'POST', '/api/v1/tourist/payments/verify', {
+      token: touristToken,
+      body: {
+        paymentId,
+        razorpay_order_id: orderId,
+        razorpay_payment_id: paymentProviderId,
+        razorpay_signature: validSignature,
+      },
+    });
+
+    const res = await dispatchRequest(app, 'POST', `/api/v1/admin/payments/${paymentId}/refund`, {
+      token: adminToken,
+      body: { reason: 'Notification and audit verification refund' },
+    });
+
+    assert.strictEqual(res.status, 200);
+
+    // Verify Notification
+    const refundNotifs = mockNotif.publishedEvents.filter(
+      (e) => e.notificationType === NOTIFICATION_TYPES.PAYMENT_REFUNDED,
+    );
+    assert.strictEqual(refundNotifs.length, 1);
+    assert.strictEqual(refundNotifs[0].recipientAccountId, touristId.toString());
+
+    // Verify Audit Log
+    const refundAudits = mockAudit.recordedLogs.filter(
+      (l) => l.action === ADMIN_AUDIT_ACTIONS.PAYMENT_REFUNDED,
+    );
+    assert.ok(refundAudits.length >= 1);
+    assert.strictEqual(refundAudits[0].actorAccountId.toString(), adminId.toString());
+    assert.strictEqual(refundAudits[0].targetEntityId.toString(), paymentId);
+  });
+
+  it('48. Full refund of late captured payment does NOT restore inventory twice (zero phantom inventory restoration)', async () => {
+    const initRes = await dispatchRequest(app, 'POST', `/api/v1/tourist/bookings/${bookingId}/payments`, {
+      token: touristToken,
+    });
+    const paymentId = initRes.body.data.payment.id;
+    const orderId = initRes.body.data.checkoutData.orderId;
+    const paymentProviderId = 'pay_late_zero_phantom_01';
+
+    // Simulate hold expired (so hold is EXPIRED and units were already released back to inventory)
+    const hold = testBookingsRepo.inMemoryHolds.get(holdId.toString())!;
+    hold.status = INVENTORY_HOLD_STATUSES.EXPIRED;
+    hold.expiresAt = new Date(Date.now() - 5000);
+
+    // Initial inventory had 4 available, 1 held.
+    // Expiring the hold returned that 1 unit back, so available units is 5 for all stay dates.
+    for (const dateStr of stayDates) {
+      const inv = testRoomRepo.inMemoryInventory.get(`${roomTypeId.toString()}:${dateStr}`)!;
+      inv.availableUnits = 5;
+    }
+
+    const validSignature = crypto
+      .createHmac('sha256', testKeySecret)
+      .update(`${orderId}|${paymentProviderId}`)
+      .digest('hex');
+
+    // Late payment verification captures payment with FLAGGED_FOR_MANUAL_REVIEW
+    await dispatchRequest(app, 'POST', '/api/v1/tourist/payments/verify', {
+      token: touristToken,
+      body: {
+        paymentId,
+        razorpay_order_id: orderId,
+        razorpay_payment_id: paymentProviderId,
+        razorpay_signature: validSignature,
+      },
+    });
+
+    // Admin processes full refund on the late payment
+    const refundRes = await dispatchRequest(app, 'POST', `/api/v1/admin/payments/${paymentId}/refund`, {
+      token: adminToken,
+      body: { reason: 'Late payment reconciliation refund to guest' },
+    });
+    assert.strictEqual(refundRes.status, 200);
+
+    // CRITICAL SECURITY ASSERTION: Available units must remain exactly 5, NOT 6!
+    for (const dateStr of stayDates) {
+      const inv = testRoomRepo.inMemoryInventory.get(`${roomTypeId.toString()}:${dateStr}`)!;
+      assert.strictEqual(inv.availableUnits, 5, `Inventory on ${dateStr} was incremented beyond initial capacity!`);
+    }
+  });
+
+  it('49. Admin can list refunds for a payment (GET /api/v1/admin/payments/:paymentId/refunds)', async () => {
+    const initRes = await dispatchRequest(app, 'POST', `/api/v1/tourist/bookings/${bookingId}/payments`, {
+      token: touristToken,
+    });
+    const paymentId = initRes.body.data.payment.id;
+    const orderId = initRes.body.data.checkoutData.orderId;
+    const paymentProviderId = 'pay_list_refunds_01';
+
+    const validSignature = crypto
+      .createHmac('sha256', testKeySecret)
+      .update(`${orderId}|${paymentProviderId}`)
+      .digest('hex');
+
+    await dispatchRequest(app, 'POST', '/api/v1/tourist/payments/verify', {
+      token: touristToken,
+      body: {
+        paymentId,
+        razorpay_order_id: orderId,
+        razorpay_payment_id: paymentProviderId,
+        razorpay_signature: validSignature,
+      },
+    });
+
+    // Issue two partial refunds
+    await dispatchRequest(app, 'POST', `/api/v1/admin/payments/${paymentId}/refund`, {
+      token: adminToken,
+      body: { amountPaise: 300000, reason: 'Partial 1' },
+    });
+    await dispatchRequest(app, 'POST', `/api/v1/admin/payments/${paymentId}/refund`, {
+      token: adminToken,
+      body: { amountPaise: 400000, reason: 'Partial 2' },
+    });
+
+    const res = await dispatchRequest(app, 'GET', `/api/v1/admin/payments/${paymentId}/refunds`, {
+      token: adminToken,
+    });
+
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(res.body.success, true);
+    assert.strictEqual(res.body.data.refunds.length, 2);
+    assert.strictEqual(res.body.data.total, 2);
+  });
+
+  it('50. Admin can retrieve refund by ID (GET /api/v1/admin/payments/refunds/:refundId)', async () => {
+    const initRes = await dispatchRequest(app, 'POST', `/api/v1/tourist/bookings/${bookingId}/payments`, {
+      token: touristToken,
+    });
+    const paymentId = initRes.body.data.payment.id;
+    const orderId = initRes.body.data.checkoutData.orderId;
+    const paymentProviderId = 'pay_get_refund_01';
+
+    const validSignature = crypto
+      .createHmac('sha256', testKeySecret)
+      .update(`${orderId}|${paymentProviderId}`)
+      .digest('hex');
+
+    await dispatchRequest(app, 'POST', '/api/v1/tourist/payments/verify', {
+      token: touristToken,
+      body: {
+        paymentId,
+        razorpay_order_id: orderId,
+        razorpay_payment_id: paymentProviderId,
+        razorpay_signature: validSignature,
+      },
+    });
+
+    const refundRes = await dispatchRequest(app, 'POST', `/api/v1/admin/payments/${paymentId}/refund`, {
+      token: adminToken,
+      body: { amountPaise: 500000, reason: 'Retrieve test refund' },
+    });
+    assert.strictEqual(refundRes.status, 200);
+    const refundId = refundRes.body.data.refund.id;
+
+    const res = await dispatchRequest(app, 'GET', `/api/v1/admin/payments/refunds/${refundId}`, {
+      token: adminToken,
+    });
+
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(res.body.success, true);
+    assert.strictEqual(res.body.data.id, refundId);
+    assert.strictEqual(res.body.data.amountPaise, 500000);
   });
 });

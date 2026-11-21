@@ -266,6 +266,165 @@ export class PaymentsRepository {
       .exec();
   }
 
+  public async reserveRefundBalance(
+    paymentId: string | Types.ObjectId,
+    amountPaise: number,
+    session?: ClientSession,
+  ): Promise<IPaymentLean | null> {
+    const idStr = paymentId.toString();
+
+    if (mongoose.connection.readyState === 0) {
+      const p = this.inMemoryPayments.get(idStr);
+      if (!p) return null;
+      const currentCumulative = p.cumulativeRefundedPaise || 0;
+      const currentPending = p.pendingRefundPaise || 0;
+      if (currentCumulative + currentPending + amountPaise > p.amountPaise) {
+        return null;
+      }
+
+      const updated: IPaymentLean = {
+        ...p,
+        pendingRefundPaise: currentPending + amountPaise,
+        status: p.status === PAYMENT_STATUSES.CAPTURED ? PAYMENT_STATUSES.REFUND_PENDING : p.status,
+        updatedAt: new Date(),
+      };
+      this.inMemoryPayments.set(idStr, updated);
+      return updated;
+    }
+
+    const p = await PaymentModel.findById(paymentId).session(session || null);
+    if (!p) return null;
+    const currentCumulative = p.cumulativeRefundedPaise || 0;
+    const currentPending = p.pendingRefundPaise || 0;
+    if (currentCumulative + currentPending + amountPaise > p.amountPaise) {
+      return null;
+    }
+
+    const updated = await PaymentModel.findOneAndUpdate(
+      {
+        _id: paymentId,
+        $expr: {
+          $lte: [
+            { $add: [{ $ifNull: ['$cumulativeRefundedPaise', 0] }, { $ifNull: ['$pendingRefundPaise', 0] }, amountPaise] },
+            '$amountPaise',
+          ],
+        },
+      },
+      {
+        $inc: { pendingRefundPaise: amountPaise },
+        $set: {
+          status: p.status === PAYMENT_STATUSES.CAPTURED ? PAYMENT_STATUSES.REFUND_PENDING : p.status,
+        },
+      },
+      { new: true, session },
+    )
+      .lean<IPaymentLean>()
+      .exec();
+
+    return updated;
+  }
+
+  public async settleRefundBalance(
+    paymentId: string | Types.ObjectId,
+    amountPaise: number,
+    latestRefundId: string,
+    reason?: string | null,
+    session?: ClientSession,
+  ): Promise<IPaymentLean | null> {
+    const idStr = paymentId.toString();
+
+    if (mongoose.connection.readyState === 0) {
+      const p = this.inMemoryPayments.get(idStr);
+      if (!p) return null;
+      const currentCumulative = (p.cumulativeRefundedPaise || 0) + amountPaise;
+      const currentPending = Math.max(0, (p.pendingRefundPaise || 0) - amountPaise);
+      const isFullyRefunded = currentCumulative >= p.amountPaise;
+
+      const updated: IPaymentLean = {
+        ...p,
+        cumulativeRefundedPaise: currentCumulative,
+        pendingRefundPaise: currentPending,
+        refundAmountPaise: currentCumulative,
+        refundId: latestRefundId,
+        refundReason: reason !== undefined ? reason : p.refundReason,
+        refundedAt: new Date(),
+        status: isFullyRefunded ? PAYMENT_STATUSES.REFUNDED : PAYMENT_STATUSES.CAPTURED,
+        reconciliationStatus: isFullyRefunded ? 'REFUNDED' : 'PARTIALLY_REFUNDED',
+        updatedAt: new Date(),
+      };
+      this.inMemoryPayments.set(idStr, updated);
+      return updated;
+    }
+
+    const p = await PaymentModel.findById(paymentId).session(session || null);
+    if (!p) return null;
+    const currentCumulative = (p.cumulativeRefundedPaise || 0) + amountPaise;
+    const currentPending = Math.max(0, (p.pendingRefundPaise || 0) - amountPaise);
+    const isFullyRefunded = currentCumulative >= p.amountPaise;
+
+    const updateSet: Record<string, any> = {
+      cumulativeRefundedPaise: currentCumulative,
+      pendingRefundPaise: currentPending,
+      refundAmountPaise: currentCumulative,
+      refundId: latestRefundId,
+      refundedAt: new Date(),
+      status: isFullyRefunded ? PAYMENT_STATUSES.REFUNDED : PAYMENT_STATUSES.CAPTURED,
+      reconciliationStatus: isFullyRefunded ? 'REFUNDED' : 'PARTIALLY_REFUNDED',
+    };
+    if (reason !== undefined) {
+      updateSet.refundReason = reason;
+    }
+
+    return PaymentModel.findByIdAndUpdate(
+      paymentId,
+      {
+        $set: updateSet,
+      },
+      { new: true, session },
+    )
+      .lean<IPaymentLean>()
+      .exec();
+  }
+
+  public async releaseRefundBalance(
+    paymentId: string | Types.ObjectId,
+    amountPaise: number,
+    session?: ClientSession,
+  ): Promise<IPaymentLean | null> {
+    const idStr = paymentId.toString();
+
+    if (mongoose.connection.readyState === 0) {
+      const p = this.inMemoryPayments.get(idStr);
+      if (!p) return null;
+      const currentPending = Math.max(0, (p.pendingRefundPaise || 0) - amountPaise);
+      const updated: IPaymentLean = {
+        ...p,
+        pendingRefundPaise: currentPending,
+        status: (p.cumulativeRefundedPaise || 0) >= p.amountPaise ? PAYMENT_STATUSES.REFUNDED : PAYMENT_STATUSES.CAPTURED,
+        updatedAt: new Date(),
+      };
+      this.inMemoryPayments.set(idStr, updated);
+      return updated;
+    }
+
+    const p = await PaymentModel.findById(paymentId).session(session || null);
+    if (!p) return null;
+    const currentPending = Math.max(0, (p.pendingRefundPaise || 0) - amountPaise);
+
+    return PaymentModel.findByIdAndUpdate(
+      paymentId,
+      {
+        $set: {
+          pendingRefundPaise: currentPending,
+          status: (p.cumulativeRefundedPaise || 0) >= p.amountPaise ? PAYMENT_STATUSES.REFUNDED : PAYMENT_STATUSES.CAPTURED,
+        },
+      },
+      { new: true, session },
+    )
+      .lean<IPaymentLean>()
+      .exec();
+  }
+
   public async listPayments(filter: {
     touristAccountId?: string | Types.ObjectId;
     status?: PaymentStatus;

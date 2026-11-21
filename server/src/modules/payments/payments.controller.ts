@@ -168,6 +168,36 @@ export class PaymentsController {
       next(err);
     }
   };
+
+  public listRefundsForPayment = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+    try {
+      const { paymentId } = req.params;
+      const result = await this.service.listRefundsForPayment(paymentId);
+
+      res.status(200).json({
+        success: true,
+        message: 'Refunds retrieved successfully',
+        data: result,
+      });
+    } catch (err) {
+      next(err);
+    }
+  };
+
+  public getRefundById = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+    try {
+      const { refundId } = req.params;
+      const result = await this.service.getRefundById(refundId);
+
+      res.status(200).json({
+        success: true,
+        message: 'Refund retrieved successfully',
+        data: result,
+      });
+    } catch (err) {
+      next(err);
+    }
+  };
 }
 
 export const paymentsController = new PaymentsController();

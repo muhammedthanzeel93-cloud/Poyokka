@@ -2284,10 +2284,27 @@ export const refundPaymentSchema = z
       .min(3, 'Refund reason must be at least 3 characters')
       .max(500, 'Refund reason cannot exceed 500 characters')
       .optional(),
+    idempotencyKey: z
+      .string()
+      .trim()
+      .min(8, 'Idempotency key must be at least 8 characters')
+      .max(100, 'Idempotency key cannot exceed 100 characters')
+      .optional(),
   })
   .strict({ message: 'Unrecognized fields in refund request' });
 
 export type RefundPaymentInput = z.infer<typeof refundPaymentSchema>;
+
+export const refundIdParamSchema = z
+  .object({
+    refundId: z
+      .string({ required_error: 'Refund ID is required' })
+      .trim()
+      .regex(/^[0-9a-fA-F]{24}$/, 'Refund ID must be a valid 24-character hexadecimal ObjectId'),
+  })
+  .strict({ message: 'Unrecognized parameters' });
+
+export type RefundIdParamInput = z.infer<typeof refundIdParamSchema>;
 
 // ============================================================================
 // NOTIFICATION & DEVICE SCHEMAS (DAY 26)

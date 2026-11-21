@@ -38,6 +38,7 @@ import {
   INVENTORY_HOLD_STATUSES,
   PAYMENT_PROVIDERS,
   PAYMENT_STATUSES,
+  REFUND_STATUSES,
   PAYMENT_WEBHOOK_STATUSES,
   NOTIFICATION_TYPES,
   DEVICE_PLATFORMS,
@@ -52,6 +53,7 @@ export type BookingStatus = (typeof BOOKING_STATUSES)[keyof typeof BOOKING_STATU
 export type InventoryHoldStatus = (typeof INVENTORY_HOLD_STATUSES)[keyof typeof INVENTORY_HOLD_STATUSES];
 export type PaymentProvider = (typeof PAYMENT_PROVIDERS)[keyof typeof PAYMENT_PROVIDERS];
 export type PaymentStatus = (typeof PAYMENT_STATUSES)[keyof typeof PAYMENT_STATUSES];
+export type RefundStatus = (typeof REFUND_STATUSES)[keyof typeof REFUND_STATUSES];
 export type PaymentWebhookStatus = (typeof PAYMENT_WEBHOOK_STATUSES)[keyof typeof PAYMENT_WEBHOOK_STATUSES];
 export type DestinationStatus = (typeof DESTINATION_STATUSES)[keyof typeof DESTINATION_STATUSES];
 export type KeralaDistrict = (typeof KERALA_DISTRICTS)[number];
@@ -1333,8 +1335,35 @@ export interface PaymentDto {
   paidAt?: string | null;
   refundId?: string | null;
   refundAmountPaise?: number | null;
+  cumulativeRefundedPaise?: number;
+  pendingRefundPaise?: number;
+  remainingRefundablePaise?: number;
   refundedAt?: string | null;
   refundReason?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface RefundDto {
+  id: string;
+  refundReference: string;
+  paymentId: string;
+  bookingId: string;
+  touristAccountId: string;
+  provider: PaymentProvider;
+  providerPaymentId: string;
+  providerRefundId?: string | null;
+  amountPaise: number;
+  amountInr: number;
+  currency: string;
+  status: RefundStatus;
+  reason?: string | null;
+  adminAccountId: string;
+  idempotencyKey?: string | null;
+  providerReference?: string | null;
+  failureCode?: string | null;
+  failureDescription?: string | null;
+  processedAt?: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -1367,12 +1396,12 @@ export interface VerifyPaymentResponseDto {
 }
 
 export interface RefundPaymentResponseDto {
+  refund: RefundDto;
   payment: PaymentDto;
-  refundId: string;
-  amountPaise: number;
-  currency: string;
-  status: string;
+  remainingRefundablePaise: number;
   message: string;
+  refundId?: string;
+  amountPaise?: number;
 }
 
 export interface PaymentWebhookResultDto {

@@ -5,6 +5,7 @@ import {
   verifyPaymentSignatureSchema,
   paymentIdParamSchema,
   refundPaymentSchema,
+  refundIdParamSchema,
   paymentQueryFilterSchema,
 } from '@kerala-tourism/validation';
 import { authenticate } from '../../middlewares/auth.middleware';
@@ -85,6 +86,36 @@ adminPaymentRoutes.post(
   validateParams(paymentIdParamSchema),
   validateBody(refundPaymentSchema),
   paymentsController.refundPayment,
+);
+
+// GET /api/v1/admin/payments/refunds/:refundId
+adminPaymentRoutes.get(
+  '/refunds/:refundId',
+  authenticate,
+  requireActiveAccount,
+  requireAccountType(ACCOUNT_TYPES.ADMIN),
+  requireAnyPermission([
+    ADMIN_PERMISSIONS.MANAGE_BOOKINGS,
+    ADMIN_PERMISSIONS.HANDLE_DISPUTES,
+    ADMIN_PERMISSIONS.VIEW_DASHBOARD,
+  ]),
+  validateParams(refundIdParamSchema),
+  paymentsController.getRefundById,
+);
+
+// GET /api/v1/admin/payments/:paymentId/refunds
+adminPaymentRoutes.get(
+  '/:paymentId/refunds',
+  authenticate,
+  requireActiveAccount,
+  requireAccountType(ACCOUNT_TYPES.ADMIN),
+  requireAnyPermission([
+    ADMIN_PERMISSIONS.MANAGE_BOOKINGS,
+    ADMIN_PERMISSIONS.HANDLE_DISPUTES,
+    ADMIN_PERMISSIONS.VIEW_DASHBOARD,
+  ]),
+  validateParams(paymentIdParamSchema),
+  paymentsController.listRefundsForPayment,
 );
 
 // GET /api/v1/admin/payments/:paymentId

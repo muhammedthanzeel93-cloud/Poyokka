@@ -171,7 +171,7 @@ export class RazorpayPaymentProvider implements IPaymentProvider {
       }
 
       // 2. Simulated failure convention
-      if (providerPaymentId.startsWith('pay_fail_')) {
+      if (providerPaymentId.startsWith('pay_fail_') && !providerPaymentId.includes('_refund_')) {
         return {
           providerPaymentId,
           providerOrderId: expectedOrderId || 'order_simulated_fail',
@@ -261,6 +261,39 @@ export class RazorpayPaymentProvider implements IPaymentProvider {
         });
       }
 
+      // 3. Simulated network timeout convention
+      if (input.providerPaymentId.startsWith('pay_timeout_refund_')) {
+        throw new BadGatewayError(
+          'Payment gateway communication failure during refund creation: request timed out',
+          'PAYMENT_GATEWAY_TIMEOUT',
+        );
+      }
+
+      // 4. Simulated pending convention
+      if (input.providerPaymentId.startsWith('pay_pending_refund_')) {
+        const pendingRefundId = `rfnd_pending_${crypto.randomBytes(6).toString('hex')}`;
+        const amountPaise = input.amountPaise ?? 500000;
+        const result: ProviderRefundResult = {
+          refundId: pendingRefundId,
+          providerPaymentId: input.providerPaymentId,
+          amountPaise,
+          currency: input.currency || 'INR',
+          status: 'pending',
+          rawResponse: {
+            id: pendingRefundId,
+            entity: 'refund',
+            amount: amountPaise,
+            currency: input.currency || 'INR',
+            payment_id: input.providerPaymentId,
+            status: 'pending',
+            created_at: Math.floor(Date.now() / 1000),
+            simulated: true,
+          },
+        };
+        this.simulatedRefunds.set(input.providerPaymentId, result);
+        return result;
+      }
+
       const refundId = `rfnd_${crypto.randomBytes(8).toString('hex')}`;
       const amountPaise = input.amountPaise ?? 500000;
       const currency = input.currency || 'INR';
@@ -309,6 +342,7 @@ export class RazorpayPaymentProvider implements IPaymentProvider {
           'Content-Type': 'application/json',
         },
         body: Object.keys(bodyPayload).length > 0 ? JSON.stringify(bodyPayload) : undefined,
+        signal: AbortSignal.timeout(10000),
       });
 
       if (!response.ok) {

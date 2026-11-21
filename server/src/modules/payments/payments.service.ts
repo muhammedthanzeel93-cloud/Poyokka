@@ -2,6 +2,7 @@ import crypto from 'crypto';
 import { Types } from 'mongoose';
 import {
   PAYMENT_STATUSES,
+  REFUND_STATUSES,
   PAYMENT_PROVIDERS,
   ADMIN_AUDIT_ACTIONS,
   AUDIT_TARGET_ENTITY_TYPES,
@@ -11,11 +12,13 @@ import {
 import {
   BadRequestError,
   NotFoundError,
+  ConflictError,
 } from '../../shared/errors/AppError';
 import { env } from '../../config/env';
 import { IPaymentProvider } from './providers/payment-provider.interface';
 import { PaymentProviderFactory } from './providers/payment-provider.factory';
 import { PaymentsRepository, paymentsRepository } from './payments.repository';
+import { RefundsRepository, refundsRepository } from './refund.repository';
 import { BookingsRepository, bookingsRepository } from '../bookings/bookings.repository';
 import { PropertyRepository, propertyRepository } from '../properties/property.repository';
 import { AuditLogService, auditLogService } from '../admin/audit-log.service';
@@ -28,7 +31,9 @@ import {
 import { generatePaymentReference } from './payments.validation';
 import {
   IPaymentLean,
+  IRefundLean,
   PaymentDto,
+  RefundDto,
   CreatePaymentResponseDto,
   VerifyPaymentResponseDto,
   RefundPaymentResponseDto,
@@ -36,6 +41,7 @@ import {
 
 export class PaymentsService {
   private repo: PaymentsRepository;
+  private refundsRepo: RefundsRepository;
   private bookingsRepo: BookingsRepository;
   private propertyRepo: PropertyRepository;
   private provider: IPaymentProvider;
@@ -49,8 +55,10 @@ export class PaymentsService {
     provider: IPaymentProvider = PaymentProviderFactory.getProvider(),
     auditService: AuditLogService = auditLogService,
     notifService: NotificationService = notificationService,
+    refundsRepo: RefundsRepository = refundsRepository,
   ) {
     this.repo = repo;
+    this.refundsRepo = refundsRepo;
     this.bookingsRepo = bookingsRepo;
     this.propertyRepo = propertyRepo;
     this.provider = provider;
@@ -96,11 +104,27 @@ export class PaymentsService {
     this.auditService = service;
   }
 
+  public setRefundsRepository(repo: RefundsRepository): void {
+    this.refundsRepo = repo;
+  }
+
+  public setNotificationService(service: NotificationService): void {
+    this.notifService = service;
+  }
+
+  public get refundRepository(): RefundsRepository {
+    return this.refundsRepo;
+  }
+
   // ---------------------------------------------------------------------------
   // MAPPER HELPERS
   // ---------------------------------------------------------------------------
 
   public mapPaymentToDto(payment: IPaymentLean): PaymentDto {
+    const cumulative = payment.cumulativeRefundedPaise || 0;
+    const pending = payment.pendingRefundPaise || 0;
+    const remaining = Math.max(0, payment.amountPaise - (cumulative + pending));
+
     return {
       id: payment._id.toString(),
       paymentReference: payment.paymentReference,
@@ -125,6 +149,9 @@ export class PaymentsService {
         : null,
       refundId: payment.refundId || null,
       refundAmountPaise: payment.refundAmountPaise ?? null,
+      cumulativeRefundedPaise: cumulative,
+      pendingRefundPaise: pending,
+      remainingRefundablePaise: remaining,
       refundedAt: payment.refundedAt
         ? payment.refundedAt instanceof Date
           ? payment.refundedAt.toISOString()
@@ -139,6 +166,42 @@ export class PaymentsService {
         payment.updatedAt instanceof Date
           ? payment.updatedAt.toISOString()
           : new Date(payment.updatedAt).toISOString(),
+    };
+  }
+
+  public mapRefundToDto(refund: IRefundLean): RefundDto {
+    return {
+      id: refund._id.toString(),
+      refundReference: refund.refundReference,
+      paymentId: refund.paymentId.toString(),
+      bookingId: refund.bookingId.toString(),
+      touristAccountId: refund.touristAccountId.toString(),
+      provider: refund.provider,
+      providerPaymentId: refund.providerPaymentId,
+      providerRefundId: refund.providerRefundId || null,
+      amountPaise: refund.amountPaise,
+      amountInr: refund.amountPaise / 100,
+      currency: refund.currency,
+      status: refund.status,
+      reason: refund.reason || null,
+      adminAccountId: refund.adminAccountId.toString(),
+      idempotencyKey: refund.idempotencyKey || null,
+      providerReference: refund.providerReference || null,
+      failureCode: refund.failureCode || null,
+      failureDescription: refund.failureDescription || null,
+      processedAt: refund.processedAt
+        ? refund.processedAt instanceof Date
+          ? refund.processedAt.toISOString()
+          : new Date(refund.processedAt).toISOString()
+        : null,
+      createdAt:
+        refund.createdAt instanceof Date
+          ? refund.createdAt.toISOString()
+          : new Date(refund.createdAt).toISOString(),
+      updatedAt:
+        refund.updatedAt instanceof Date
+          ? refund.updatedAt.toISOString()
+          : new Date(refund.updatedAt).toISOString(),
     };
   }
 
@@ -603,7 +666,7 @@ export class PaymentsService {
   }
 
   // ---------------------------------------------------------------------------
-  // ADMINISTRATIVE REFUND & DISPUTE APIS
+  // ADMINISTRATIVE REFUND & DISPUTE APIS (T01.3)
   // ---------------------------------------------------------------------------
 
   public async refundPayment(
@@ -616,13 +679,22 @@ export class PaymentsService {
       throw new NotFoundError('Payment record not found', 'PAYMENT_NOT_FOUND');
     }
 
-    // 1. Guard: Cannot refund an already refunded payment
-    if (payment.status === PAYMENT_STATUSES.REFUNDED) {
-      throw new BadRequestError('Payment has already been refunded', 'PAYMENT_ALREADY_REFUNDED');
+    const currentCumulative = payment.cumulativeRefundedPaise || 0;
+    const currentPending = payment.pendingRefundPaise || 0;
+
+    // 1. Guard: Cannot refund an already fully refunded payment
+    if (
+      payment.status === PAYMENT_STATUSES.REFUNDED ||
+      currentCumulative >= payment.amountPaise
+    ) {
+      throw new BadRequestError('Payment has already been fully refunded', 'PAYMENT_ALREADY_REFUNDED');
     }
 
-    // 2. Guard: Only CAPTURED payments can be refunded
-    if (payment.status !== PAYMENT_STATUSES.CAPTURED) {
+    // 2. Guard: Check payment eligibility
+    if (
+      payment.status !== PAYMENT_STATUSES.CAPTURED &&
+      payment.status !== PAYMENT_STATUSES.REFUND_PENDING
+    ) {
       throw new BadRequestError(
         `Cannot refund payment with status '${payment.status}'. Only captured payments can be refunded.`,
         'PAYMENT_NOT_CAPTURED',
@@ -637,98 +709,265 @@ export class PaymentsService {
       );
     }
 
-    // 4. Validate refund amount
-    const refundAmountPaise = input.amountPaise !== undefined ? input.amountPaise : payment.amountPaise;
-    if (refundAmountPaise <= 0 || refundAmountPaise > payment.amountPaise) {
+    // 4. Enforce Idempotency: Return existing refund if idempotencyKey was already processed
+    if (input.idempotencyKey) {
+      const existingRefund = await this.refundsRepo.findRefundByPaymentAndIdempotencyKey(
+        payment._id,
+        input.idempotencyKey,
+      );
+      if (existingRefund) {
+        const latestPayment = await this.repo.findPaymentById(payment._id);
+        const remaining = Math.max(
+          0,
+          payment.amountPaise -
+            ((latestPayment?.cumulativeRefundedPaise || 0) + (latestPayment?.pendingRefundPaise || 0)),
+        );
+        return {
+          refund: this.mapRefundToDto(existingRefund),
+          payment: this.mapPaymentToDto(latestPayment || payment),
+          remainingRefundablePaise: remaining,
+          refundId: existingRefund.providerRefundId || existingRefund.refundReference,
+          amountPaise: existingRefund.amountPaise,
+          message: `Refund ${existingRefund.refundReference} retrieved via idempotent replay`,
+        };
+      }
+    }
+
+    // 5. Calculate remaining refundable balance and validate requested amount
+    const remainingBalance = Math.max(0, payment.amountPaise - (currentCumulative + currentPending));
+    const requestedAmountPaise =
+      input.amountPaise !== undefined ? input.amountPaise : remainingBalance;
+
+    if (requestedAmountPaise <= 0 || requestedAmountPaise > remainingBalance) {
       throw new BadRequestError(
-        `Refund amount (${refundAmountPaise} paise) must be positive and cannot exceed payment amount (${payment.amountPaise} paise)`,
+        `Refund amount (${requestedAmountPaise} paise) must be positive and cannot exceed remaining refundable balance (${remainingBalance} paise)`,
         'INVALID_REFUND_AMOUNT',
       );
     }
 
-    // 5. Invoke Payment Provider Gateway Refund API
-    const refundResult = await this.provider.createRefund({
-      providerPaymentId: payment.providerPaymentId,
-      amountPaise: refundAmountPaise,
-      currency: payment.currency,
-      notes: {
-        paymentReference: payment.paymentReference,
-        adminAccountId,
-        reason: input.reason || 'Administrative refund processed',
-      },
-      receipt: `rcpt_rfnd_${payment.paymentReference}`,
-    });
-
-    const now = new Date();
-
-    // 6. Update Payment Record
-    const updatedPayment = await this.repo.updatePayment(payment._id, {
-      status: PAYMENT_STATUSES.REFUNDED,
-      refundId: refundResult.refundId,
-      refundAmountPaise: refundResult.amountPaise,
-      refundedAt: now,
-      refundReason: input.reason || 'Administrative refund processed',
-      reconciliationStatus: 'REFUNDED',
-    });
-
-    // 7. If associated booking was AWAITING_PAYMENT or CONFIRMED, update to CANCELLED
-    const booking = await this.bookingsRepo.findBookingById(payment.bookingId);
-    if (
-      booking &&
-      booking.status !== BOOKING_STATUSES.CANCELLED &&
-      booking.status !== BOOKING_STATUSES.EXPIRED
-    ) {
-      await this.bookingsRepo.updateBooking(booking._id, {
-        status: BOOKING_STATUSES.CANCELLED,
-      });
+    // 6. Database-level atomic balance reservation
+    const reservedPayment = await this.repo.reserveRefundBalance(
+      payment._id,
+      requestedAmountPaise,
+    );
+    if (!reservedPayment) {
+      throw new ConflictError(
+        'Concurrent refund attempt exceeded remaining refundable balance',
+        'REFUND_BALANCE_EXCEEDED',
+      );
     }
 
-    // 8. Record Immutable Audit Log
+    // 7. Create persistent Refund record in PROCESSING state
+    const refundRef = `RFND-${Date.now().toString(36).toUpperCase()}-${Math.floor(1000 + Math.random() * 9000)}`;
+    const refundRecord = await this.refundsRepo.createRefund({
+      refundReference: refundRef,
+      paymentId: payment._id,
+      bookingId: payment.bookingId,
+      touristAccountId: payment.touristAccountId,
+      provider: payment.provider,
+      providerPaymentId: payment.providerPaymentId,
+      amountPaise: requestedAmountPaise,
+      currency: payment.currency,
+      status: REFUND_STATUSES.PROCESSING,
+      reason: input.reason || 'Administrative refund processed',
+      adminAccountId: new Types.ObjectId(adminAccountId),
+      idempotencyKey: input.idempotencyKey || null,
+      providerReference: `rcpt_${refundRef}`,
+    });
+
+    // 8. Invoke Payment Provider Gateway Refund API
+    let refundResult: any;
+    try {
+      refundResult = await this.provider.createRefund({
+        providerPaymentId: payment.providerPaymentId,
+        amountPaise: requestedAmountPaise,
+        currency: payment.currency,
+        notes: {
+          paymentReference: payment.paymentReference,
+          refundReference: refundRef,
+          adminAccountId,
+          reason: input.reason || 'Administrative refund processed',
+        },
+        receipt: `rcpt_${refundRef}`,
+      });
+    } catch (err: any) {
+      const isTimeout =
+        err.code === 'PAYMENT_GATEWAY_TIMEOUT' ||
+        err.name === 'TimeoutError' ||
+        (err.message && err.message.toLowerCase().includes('timed out'));
+
+      if (isTimeout) {
+        // Safe timeout handling: Preserve indeterminate pending state, DO NOT release reserved balance!
+        await this.refundsRepo.updateRefund(refundRecord._id, {
+          status: REFUND_STATUSES.PENDING,
+          failureCode: err.code || 'PAYMENT_GATEWAY_TIMEOUT',
+          failureDescription: 'Gateway communication timed out. Preserving pending status for reconciliation.',
+        });
+        await this.repo.updatePayment(payment._id, {
+          status: PAYMENT_STATUSES.REFUND_PENDING,
+        });
+
+        await this.auditService.recordAdminAction({
+          actorAccountId: adminAccountId,
+          actorAccountType: 'ADMIN',
+          action: ADMIN_AUDIT_ACTIONS.PAYMENT_REFUNDED,
+          targetEntityId: payment._id,
+          targetEntityType: AUDIT_TARGET_ENTITY_TYPES.PAYMENT,
+          reason: `Refund timed out at gateway: ${err.message}. Preserved in REFUND_PENDING status.`,
+          beforeState: { status: payment.status },
+          afterState: { status: PAYMENT_STATUSES.REFUND_PENDING, failureCode: 'PAYMENT_GATEWAY_TIMEOUT' },
+        });
+
+        throw err;
+      }
+
+      // On definitive non-timeout provider failure: Mark refund FAILED and release reserved balance
+      await this.refundsRepo.updateRefund(refundRecord._id, {
+        status: REFUND_STATUSES.FAILED,
+        failureCode: err.code || 'GATEWAY_ERROR',
+        failureDescription: err.message || 'Refund failed at gateway',
+      });
+      await this.repo.releaseRefundBalance(payment._id, requestedAmountPaise);
+
+      await this.auditService.recordAdminAction({
+        actorAccountId: adminAccountId,
+        actorAccountType: 'ADMIN',
+        action: ADMIN_AUDIT_ACTIONS.PAYMENT_REFUNDED,
+        targetEntityId: payment._id,
+        targetEntityType: AUDIT_TARGET_ENTITY_TYPES.PAYMENT,
+        reason: `Refund attempt failed: ${err.message}`,
+        beforeState: { status: payment.status },
+        afterState: { status: 'FAILED', failureCode: err.code || 'GATEWAY_ERROR' },
+      });
+
+      throw err;
+    }
+
+    // 9. Process Gateway Response
+    if (refundResult.status === 'processed') {
+      const updatedRefund = await this.refundsRepo.updateRefund(refundRecord._id, {
+        status: REFUND_STATUSES.PROCESSED,
+        providerRefundId: refundResult.refundId,
+        processedAt: new Date(),
+      });
+
+      const settledPayment = await this.repo.settleRefundBalance(
+        payment._id,
+        requestedAmountPaise,
+        refundResult.refundId,
+        input.reason,
+      );
+
+      const isFullyRefunded = (settledPayment?.cumulativeRefundedPaise || 0) >= payment.amountPaise;
+
+      // 10. Booking & Inventory Safety
+      if (isFullyRefunded) {
+        const booking = await this.bookingsRepo.findBookingById(payment.bookingId);
+        if (
+          booking &&
+          booking.status !== BOOKING_STATUSES.CANCELLED &&
+          booking.status !== BOOKING_STATUSES.EXPIRED
+        ) {
+          await this.bookingsRepo.updateBooking(booking._id, {
+            status: BOOKING_STATUSES.CANCELLED,
+          });
+
+          // Check if inventory was consumed and release if needed
+          const hold = await this.bookingsRepo.findHoldById(payment.holdId);
+          if (hold && hold.status === INVENTORY_HOLD_STATUSES.CONSUMED) {
+            await this.bookingsRepo.releaseHold(payment.holdId);
+          }
+        }
+      }
+
+      // 11. Immutable Audit Logging
+      await this.auditService.recordAdminAction({
+        actorAccountId: adminAccountId,
+        actorAccountType: 'ADMIN',
+        action: ADMIN_AUDIT_ACTIONS.PAYMENT_REFUNDED,
+        targetEntityId: payment._id,
+        targetEntityType: AUDIT_TARGET_ENTITY_TYPES.PAYMENT,
+        reason: input.reason || 'Administrative refund processed',
+        beforeState: {
+          status: payment.status,
+          cumulativeRefundedPaise: currentCumulative,
+        },
+        afterState: {
+          status: settledPayment?.status || PAYMENT_STATUSES.REFUNDED,
+          refundId: refundResult.refundId,
+          refundAmountPaise: requestedAmountPaise,
+          cumulativeRefundedPaise: settledPayment?.cumulativeRefundedPaise,
+        },
+      });
+
+      // 12. Guest Notification Dispatch
+      await this.notifService
+        .publishEvent({
+          recipientAccountId: payment.touristAccountId.toString(),
+          notificationType: NOTIFICATION_TYPES.PAYMENT_REFUNDED,
+          title: 'Refund Processed',
+          body: `A refund of ₹${(requestedAmountPaise / 100).toFixed(2)} for payment ${payment.paymentReference} has been processed to your original payment method.`,
+          dataPayload: {
+            route: 'booking_details',
+            bookingId: payment.bookingId.toString(),
+            paymentId: payment._id.toString(),
+            refundId: refundResult.refundId,
+          },
+          relatedResourceType: 'PAYMENT',
+          relatedResourceId: payment._id.toString(),
+          idempotencyKey: `evt_refund_${refundRecord._id.toString()}`,
+        })
+        .catch((err) => console.error('[Notification Publish Error]:', err));
+
+      const finalRemaining = Math.max(
+        0,
+        payment.amountPaise - (settledPayment?.cumulativeRefundedPaise || 0),
+      );
+
+      return {
+        refund: this.mapRefundToDto(updatedRefund || refundRecord),
+        payment: this.mapPaymentToDto(settledPayment || payment),
+        remainingRefundablePaise: finalRemaining,
+        refundId: refundResult.refundId,
+        amountPaise: requestedAmountPaise,
+        message: `Refund of ₹${(requestedAmountPaise / 100).toFixed(2)} processed successfully`,
+      };
+    }
+
+    // Pending provider status handling
+    const updatedRefund = await this.refundsRepo.updateRefund(refundRecord._id, {
+      status: REFUND_STATUSES.PENDING,
+      providerRefundId: refundResult.refundId,
+    });
+
+    const updatedPayment = await this.repo.updatePayment(payment._id, {
+      status: PAYMENT_STATUSES.REFUND_PENDING,
+    });
+
     await this.auditService.recordAdminAction({
       actorAccountId: adminAccountId,
       actorAccountType: 'ADMIN',
       action: ADMIN_AUDIT_ACTIONS.PAYMENT_REFUNDED,
       targetEntityId: payment._id,
       targetEntityType: AUDIT_TARGET_ENTITY_TYPES.PAYMENT,
-      reason: input.reason || 'Administrative refund processed',
-      beforeState: {
-        status: payment.status,
-        reconciliationStatus: payment.reconciliationStatus,
-      },
+      reason: 'Refund initiated and currently pending provider settlement',
+      beforeState: { status: payment.status },
       afterState: {
-        status: PAYMENT_STATUSES.REFUNDED,
+        status: PAYMENT_STATUSES.REFUND_PENDING,
         refundId: refundResult.refundId,
-        refundAmountPaise: refundResult.amountPaise,
-        reconciliationStatus: 'REFUNDED',
       },
     });
 
-    // 9. Dispatch Guest Notification
-    await this.notifService
-      .publishEvent({
-        recipientAccountId: payment.touristAccountId.toString(),
-        notificationType: NOTIFICATION_TYPES.PAYMENT_REFUNDED,
-        title: 'Payment Refund Processed',
-        body: `A refund of ₹${(refundResult.amountPaise / 100).toFixed(2)} for payment ${payment.paymentReference} has been processed to your original payment method.`,
-        dataPayload: {
-          route: 'booking_details',
-          bookingId: payment.bookingId.toString(),
-          paymentId: payment._id.toString(),
-          refundId: refundResult.refundId,
-        },
-        relatedResourceType: 'PAYMENT',
-        relatedResourceId: payment._id.toString(),
-        idempotencyKey: `evt_refund_${payment._id.toString()}_${refundResult.refundId}`,
-      })
-      .catch((err) => console.error('[Notification Publish Error]:', err));
-
     return {
+      refund: this.mapRefundToDto(updatedRefund || refundRecord),
       payment: this.mapPaymentToDto(updatedPayment || payment),
+      remainingRefundablePaise: Math.max(
+        0,
+        payment.amountPaise - (currentCumulative + requestedAmountPaise),
+      ),
       refundId: refundResult.refundId,
-      amountPaise: refundResult.amountPaise,
-      currency: refundResult.currency,
-      status: refundResult.status,
-      message: `Refund of ₹${(refundResult.amountPaise / 100).toFixed(2)} processed successfully`,
+      amountPaise: requestedAmountPaise,
+      message: 'Refund initiated and currently pending gateway confirmation',
     };
   }
 
@@ -759,6 +998,29 @@ export class PaymentsService {
       limit,
       totalPages: Math.ceil(result.total / limit) || 1,
     };
+  }
+
+  public async listRefundsForPayment(
+    paymentId: string,
+  ): Promise<{ refunds: RefundDto[]; total: number }> {
+    const payment = await this.repo.findPaymentById(paymentId);
+    if (!payment) {
+      throw new NotFoundError('Payment record not found', 'PAYMENT_NOT_FOUND');
+    }
+
+    const refunds = await this.refundsRepo.listRefundsByPaymentId(paymentId);
+    return {
+      refunds: refunds.map((r) => this.mapRefundToDto(r)),
+      total: refunds.length,
+    };
+  }
+
+  public async getRefundById(refundId: string): Promise<RefundDto> {
+    const refund = await this.refundsRepo.findRefundById(refundId);
+    if (!refund) {
+      throw new NotFoundError('Refund record not found', 'REFUND_NOT_FOUND');
+    }
+    return this.mapRefundToDto(refund);
   }
 }
 

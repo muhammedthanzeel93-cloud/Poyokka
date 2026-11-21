@@ -21,6 +21,8 @@ export interface IPaymentDocument extends Document {
   paidAt?: Date | null;
   refundId?: string | null;
   refundAmountPaise?: number | null;
+  cumulativeRefundedPaise?: number;
+  pendingRefundPaise?: number;
   refundedAt?: Date | null;
   refundReason?: string | null;
   createdAt: Date;
@@ -122,6 +124,16 @@ const paymentSchema = new Schema<IPaymentDocument>(
     refundAmountPaise: {
       type: Number,
       default: null,
+    },
+    cumulativeRefundedPaise: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    pendingRefundPaise: {
+      type: Number,
+      default: 0,
+      min: 0,
     },
     refundedAt: {
       type: Date,

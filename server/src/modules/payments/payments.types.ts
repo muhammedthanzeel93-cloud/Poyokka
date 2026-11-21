@@ -2,8 +2,10 @@ import { Types } from 'mongoose';
 import {
   PaymentProvider,
   PaymentStatus,
+  RefundStatus,
   PaymentWebhookStatus,
   PaymentDto,
+  RefundDto,
   RazorpayCheckoutDataDto,
   CreatePaymentResponseDto,
   VerifyPaymentResponseDto,
@@ -30,8 +32,33 @@ export interface IPaymentLean {
   paidAt?: Date | null;
   refundId?: string | null;
   refundAmountPaise?: number | null;
+  cumulativeRefundedPaise?: number;
+  pendingRefundPaise?: number;
   refundedAt?: Date | null;
   refundReason?: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface IRefundLean {
+  _id: Types.ObjectId;
+  refundReference: string;
+  paymentId: Types.ObjectId;
+  bookingId: Types.ObjectId;
+  touristAccountId: Types.ObjectId;
+  provider: PaymentProvider;
+  providerPaymentId: string;
+  providerRefundId?: string | null;
+  amountPaise: number;
+  currency: string;
+  status: RefundStatus;
+  reason?: string | null;
+  adminAccountId: Types.ObjectId;
+  idempotencyKey?: string | null;
+  providerReference?: string | null;
+  failureCode?: string | null;
+  failureDescription?: string | null;
+  processedAt?: Date | null;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -76,8 +103,10 @@ export interface ConfirmPaymentHoldParams {
 export type {
   PaymentProvider,
   PaymentStatus,
+  RefundStatus,
   PaymentWebhookStatus,
   PaymentDto,
+  RefundDto,
   RazorpayCheckoutDataDto,
   CreatePaymentResponseDto,
   VerifyPaymentResponseDto,
