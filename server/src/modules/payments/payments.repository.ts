@@ -5,7 +5,7 @@ import {
   INVENTORY_HOLD_STATUSES,
 } from '@kerala-tourism/constants';
 import { env } from '../../config/env';
-import { InternalServerError } from '../../shared/errors/AppError';
+import { InternalServerError, ConflictError } from '../../shared/errors/AppError';
 import { PaymentModel, IPaymentDocument } from './payments.model';
 import { PaymentWebhookEventModel } from './webhook-event.model';
 import { BookingModel } from '../bookings/bookings.model';
@@ -44,8 +44,8 @@ const isUnsupportedTransactionError = (error: unknown): boolean => {
   if (typeof err.message === 'string') {
     return (
       err.message.includes('Transactions are not supported') ||
-      err.message.includes('replica set') ||
-      err.message.includes('standalone')
+      err.message.includes('Transaction numbers are only allowed on a replica set member') ||
+      err.message.includes('standalone instance')
     );
   }
   return false;
@@ -56,6 +56,8 @@ export class PaymentsRepository {
   public inMemoryWebhookEvents = new Map<string, IPaymentWebhookEventLean>();
   public inMemoryBookingsRef?: Map<string, IBookingLean>;
   public inMemoryHoldsRef?: Map<string, IInventoryHoldLean>;
+  public refundsRepoRef?: { inMemoryRefunds: Map<string, any> };
+  private inMemoryTxLock: Promise<void> = Promise.resolve();
 
   public setBookingMemoryStores(
     bookings: Map<string, IBookingLean>,
@@ -63,6 +65,10 @@ export class PaymentsRepository {
   ): void {
     this.inMemoryBookingsRef = bookings;
     this.inMemoryHoldsRef = holds;
+  }
+
+  public setRefundsRepositoryRef(repo: { inMemoryRefunds: Map<string, any> }): void {
+    this.refundsRepoRef = repo;
   }
 
   public async withTransaction<T>(fn: (session?: ClientSession) => Promise<T>): Promise<T> {
@@ -76,7 +82,80 @@ export class PaymentsRepository {
           'TRANSACTION_REQUIRED',
         );
       }
-      return await fn(undefined);
+
+      // Serialize in-memory transactions to simulate MongoDB write locks and prevent concurrent rollback races
+      const previousLock = this.inMemoryTxLock;
+      let releaseLock: () => void;
+      this.inMemoryTxLock = new Promise<void>((resolve) => {
+        releaseLock = resolve;
+      });
+
+      await previousLock;
+
+      try {
+        // Snapshot in-memory maps to support transactional rollback simulation in tests
+        const paymentsSnapshot = new Map(
+          Array.from(this.inMemoryPayments.entries()).map(([k, v]) => [k, { ...v }]),
+        );
+        const refundsSnapshot = this.refundsRepoRef
+          ? new Map(
+              Array.from(this.refundsRepoRef.inMemoryRefunds.entries()).map(([k, v]) => [k, { ...v }]),
+            )
+          : null;
+        const bookingsSnapshot = this.inMemoryBookingsRef
+          ? new Map(
+              Array.from(this.inMemoryBookingsRef.entries()).map(([k, v]) => [k, { ...v }]),
+            )
+          : null;
+        const holdsSnapshot = this.inMemoryHoldsRef
+          ? new Map(
+              Array.from(this.inMemoryHoldsRef.entries()).map(([k, v]) => [k, { ...v }]),
+            )
+          : null;
+        const webhookEventsSnapshot = new Map(
+          Array.from(this.inMemoryWebhookEvents.entries()).map(([k, v]) => [k, { ...v }]),
+        );
+
+        try {
+          return await fn(undefined);
+        } catch (txError: unknown) {
+          // Rollback in-memory stores on failure
+          this.inMemoryPayments.clear();
+          for (const [k, v] of paymentsSnapshot) {
+            this.inMemoryPayments.set(k, v);
+          }
+
+          if (refundsSnapshot && this.refundsRepoRef) {
+            this.refundsRepoRef.inMemoryRefunds.clear();
+            for (const [k, v] of refundsSnapshot) {
+              this.refundsRepoRef.inMemoryRefunds.set(k, v);
+            }
+          }
+
+          if (bookingsSnapshot && this.inMemoryBookingsRef) {
+            this.inMemoryBookingsRef.clear();
+            for (const [k, v] of bookingsSnapshot) {
+              this.inMemoryBookingsRef.set(k, v);
+            }
+          }
+
+          if (holdsSnapshot && this.inMemoryHoldsRef) {
+            this.inMemoryHoldsRef.clear();
+            for (const [k, v] of holdsSnapshot) {
+              this.inMemoryHoldsRef.set(k, v);
+            }
+          }
+
+          this.inMemoryWebhookEvents.clear();
+          for (const [k, v] of webhookEventsSnapshot) {
+            this.inMemoryWebhookEvents.set(k, v);
+          }
+
+          throw txError;
+        }
+      } finally {
+        releaseLock!();
+      }
     }
 
     for (let attempt = 1; attempt <= MAX_TX_RETRIES; attempt++) {
@@ -336,14 +415,28 @@ export class PaymentsRepository {
     if (mongoose.connection.readyState === 0) {
       const p = this.inMemoryPayments.get(idStr);
       if (!p) return null;
+
+      const currentPending = p.pendingRefundPaise || 0;
+      if (currentPending < amountPaise) {
+        throw new ConflictError(
+          `Insufficient pending refund reservation: ${currentPending} < ${amountPaise}`,
+          'INSUFFICIENT_PENDING_REFUND_BALANCE',
+        );
+      }
       const currentCumulative = (p.cumulativeRefundedPaise || 0) + amountPaise;
-      const currentPending = Math.max(0, (p.pendingRefundPaise || 0) - amountPaise);
+      if (currentCumulative > p.amountPaise) {
+        throw new ConflictError(
+          `Cumulative refund exceeds captured payment amount: ${currentCumulative} > ${p.amountPaise}`,
+          'EXCESS_CUMULATIVE_REFUND',
+        );
+      }
+      const remainingPending = currentPending - amountPaise;
       const isFullyRefunded = currentCumulative >= p.amountPaise;
 
       const updated: IPaymentLean = {
         ...p,
         cumulativeRefundedPaise: currentCumulative,
-        pendingRefundPaise: currentPending,
+        pendingRefundPaise: remainingPending,
         refundAmountPaise: currentCumulative,
         refundId: latestRefundId,
         refundReason: reason !== undefined ? reason : p.refundReason,
@@ -356,9 +449,6 @@ export class PaymentsRepository {
       return updated;
     }
 
-    const p = await PaymentModel.findById(paymentId).session(session || null);
-    if (!p) return null;
-
     const updatePipeline: any[] = [
       {
         $set: {
@@ -366,10 +456,7 @@ export class PaymentsRepository {
             $add: [{ $ifNull: ['$cumulativeRefundedPaise', 0] }, amountPaise],
           },
           pendingRefundPaise: {
-            $max: [
-              0,
-              { $subtract: [{ $ifNull: ['$pendingRefundPaise', 0] }, amountPaise] },
-            ],
+            $subtract: ['$pendingRefundPaise', amountPaise],
           },
           refundAmountPaise: {
             $add: [{ $ifNull: ['$cumulativeRefundedPaise', 0] }, amountPaise],
@@ -406,13 +493,39 @@ export class PaymentsRepository {
       },
     ];
 
-    return PaymentModel.findByIdAndUpdate(
-      paymentId,
+    const updated = await PaymentModel.findOneAndUpdate(
+      {
+        _id: paymentId,
+        pendingRefundPaise: { $gte: amountPaise },
+        $expr: {
+          $lte: [
+            { $add: [{ $ifNull: ['$cumulativeRefundedPaise', 0] }, amountPaise] },
+            '$amountPaise',
+          ],
+        },
+      },
       updatePipeline,
       { new: true, session },
     )
       .lean<IPaymentLean>()
       .exec();
+
+    if (!updated) {
+      const p = await PaymentModel.findById(paymentId).session(session || null).lean<IPaymentLean>().exec();
+      if (!p) return null;
+      if ((p.pendingRefundPaise || 0) < amountPaise) {
+        throw new ConflictError(
+          `Insufficient pending refund reservation: ${p.pendingRefundPaise || 0} < ${amountPaise}`,
+          'INSUFFICIENT_PENDING_REFUND_BALANCE',
+        );
+      }
+      throw new ConflictError(
+        `Cumulative refund would exceed captured amount: ${(p.cumulativeRefundedPaise || 0) + amountPaise} > ${p.amountPaise}`,
+        'EXCESS_CUMULATIVE_REFUND',
+      );
+    }
+
+    return updated;
   }
 
   public async releaseRefundBalance(
@@ -425,10 +538,17 @@ export class PaymentsRepository {
     if (mongoose.connection.readyState === 0) {
       const p = this.inMemoryPayments.get(idStr);
       if (!p) return null;
-      const currentPending = Math.max(0, (p.pendingRefundPaise || 0) - amountPaise);
+      const currentPending = p.pendingRefundPaise || 0;
+      if (currentPending < amountPaise) {
+        throw new ConflictError(
+          `Insufficient pending refund reservation to release: ${currentPending} < ${amountPaise}`,
+          'INSUFFICIENT_PENDING_REFUND_BALANCE',
+        );
+      }
+      const remainingPending = currentPending - amountPaise;
       const updated: IPaymentLean = {
         ...p,
-        pendingRefundPaise: currentPending,
+        pendingRefundPaise: remainingPending,
         status: (p.cumulativeRefundedPaise || 0) >= p.amountPaise ? PAYMENT_STATUSES.REFUNDED : PAYMENT_STATUSES.CAPTURED,
         updatedAt: new Date(),
       };
@@ -436,17 +556,11 @@ export class PaymentsRepository {
       return updated;
     }
 
-    const p = await PaymentModel.findById(paymentId).session(session || null);
-    if (!p) return null;
-
     const updatePipeline: any[] = [
       {
         $set: {
           pendingRefundPaise: {
-            $max: [
-              0,
-              { $subtract: [{ $ifNull: ['$pendingRefundPaise', 0] }, amountPaise] },
-            ],
+            $subtract: ['$pendingRefundPaise', amountPaise],
           },
           status: {
             $cond: [
@@ -465,13 +579,27 @@ export class PaymentsRepository {
       },
     ];
 
-    return PaymentModel.findByIdAndUpdate(
-      paymentId,
+    const updated = await PaymentModel.findOneAndUpdate(
+      {
+        _id: paymentId,
+        pendingRefundPaise: { $gte: amountPaise },
+      },
       updatePipeline,
       { new: true, session },
     )
       .lean<IPaymentLean>()
       .exec();
+
+    if (!updated) {
+      const p = await PaymentModel.findById(paymentId).session(session || null).lean<IPaymentLean>().exec();
+      if (!p) return null;
+      throw new ConflictError(
+        `Insufficient pending refund reservation to release: ${p.pendingRefundPaise || 0} < ${amountPaise}`,
+        'INSUFFICIENT_PENDING_REFUND_BALANCE',
+      );
+    }
+
+    return updated;
   }
 
   public async listPayments(filter: {

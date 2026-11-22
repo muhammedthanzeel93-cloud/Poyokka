@@ -372,12 +372,16 @@ export class BookingsRepository {
     holdId: string | Types.ObjectId,
     touristAccountId?: string | Types.ObjectId,
     session?: ClientSession,
+    allowConsumed: boolean = false,
   ): Promise<{ booking: IBookingLean; hold: IInventoryHoldLean } | null> {
     const holdIdStr = holdId.toString();
+    const allowedStatuses: string[] = allowConsumed
+      ? [INVENTORY_HOLD_STATUSES.ACTIVE, INVENTORY_HOLD_STATUSES.CONSUMED]
+      : [INVENTORY_HOLD_STATUSES.ACTIVE];
 
     if (mongoose.connection.readyState === 0) {
       const hold = this.inMemoryHolds.get(holdIdStr);
-      if (!hold || hold.status !== INVENTORY_HOLD_STATUSES.ACTIVE) {
+      if (!hold || !allowedStatuses.includes(hold.status)) {
         return null;
       }
       if (touristAccountId && hold.touristAccountId.toString() !== touristAccountId.toString()) {
@@ -407,7 +411,9 @@ export class BookingsRepository {
 
     const holdFilter: FilterQuery<IInventoryHoldDocument> = {
       _id: holdId,
-      status: INVENTORY_HOLD_STATUSES.ACTIVE,
+      status: allowConsumed
+        ? { $in: [INVENTORY_HOLD_STATUSES.ACTIVE, INVENTORY_HOLD_STATUSES.CONSUMED] }
+        : INVENTORY_HOLD_STATUSES.ACTIVE,
     };
     if (touristAccountId) {
       holdFilter.touristAccountId = touristAccountId;
@@ -449,7 +455,15 @@ export class BookingsRepository {
       .lean<IBookingLean>()
       .exec();
 
-    return { booking: booking!, hold };
+    return {
+      booking:
+        booking ||
+        (await BookingModel.findById(hold.bookingId)
+          .session(session || null)
+          .lean<IBookingLean>()
+          .exec())!,
+      hold,
+    };
   }
 
   public async expireHold(

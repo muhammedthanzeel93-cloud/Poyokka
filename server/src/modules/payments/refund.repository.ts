@@ -86,17 +86,19 @@ export class RefundsRepository {
 
   public async findRefundById(
     id: string | Types.ObjectId,
+    session?: ClientSession,
   ): Promise<IRefundLean | null> {
     const idStr = id.toString();
     if (mongoose.connection.readyState === 0) {
       return this.inMemoryRefunds.get(idStr) || null;
     }
 
-    return RefundModel.findById(id).lean<IRefundLean>().exec();
+    return RefundModel.findById(id).session(session || null).lean<IRefundLean>().exec();
   }
 
   public async findRefundByReference(
     reference: string,
+    session?: ClientSession,
   ): Promise<IRefundLean | null> {
     const refUpper = reference.toUpperCase();
     if (mongoose.connection.readyState === 0) {
@@ -107,6 +109,7 @@ export class RefundsRepository {
     }
 
     return RefundModel.findOne({ refundReference: refUpper })
+      .session(session || null)
       .lean<IRefundLean>()
       .exec();
   }
@@ -114,6 +117,7 @@ export class RefundsRepository {
   public async findRefundByPaymentAndIdempotencyKey(
     paymentId: string | Types.ObjectId,
     idempotencyKey: string,
+    session?: ClientSession,
   ): Promise<IRefundLean | null> {
     const pIdStr = paymentId.toString();
     if (mongoose.connection.readyState === 0) {
@@ -129,12 +133,14 @@ export class RefundsRepository {
       paymentId: new Types.ObjectId(pIdStr),
       idempotencyKey,
     })
+      .session(session || null)
       .lean<IRefundLean>()
       .exec();
   }
 
   public async findRefundByProviderRefundId(
     providerRefundId: string,
+    session?: ClientSession,
   ): Promise<IRefundLean | null> {
     if (mongoose.connection.readyState === 0) {
       const found = Array.from(this.inMemoryRefunds.values()).find(
@@ -144,12 +150,14 @@ export class RefundsRepository {
     }
 
     return RefundModel.findOne({ providerRefundId })
+      .session(session || null)
       .lean<IRefundLean>()
       .exec();
   }
 
   public async listRefundsByPaymentId(
     paymentId: string | Types.ObjectId,
+    session?: ClientSession,
   ): Promise<IRefundLean[]> {
     const pIdStr = paymentId.toString();
     if (mongoose.connection.readyState === 0) {
@@ -160,6 +168,7 @@ export class RefundsRepository {
     }
 
     return RefundModel.find({ paymentId: new Types.ObjectId(pIdStr) })
+      .session(session || null)
       .sort({ createdAt: -1 })
       .lean<IRefundLean[]>()
       .exec();
@@ -238,6 +247,7 @@ export class RefundsRepository {
 
   public async calculatePaymentRefundTotals(
     paymentId: string | Types.ObjectId,
+    session?: ClientSession,
   ): Promise<{ cumulativeRefundedPaise: number; pendingRefundPaise: number }> {
     const pIdStr = paymentId.toString();
     let cumulative = 0;
@@ -268,6 +278,7 @@ export class RefundsRepository {
         ],
       },
     })
+      .session(session || null)
       .lean<IRefundLean[]>()
       .exec();
 

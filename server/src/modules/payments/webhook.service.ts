@@ -1,5 +1,5 @@
 import crypto from 'crypto';
-import { Types } from 'mongoose';
+import { ClientSession } from 'mongoose';
 import {
   PAYMENT_PROVIDERS,
   PAYMENT_STATUSES,
@@ -13,6 +13,7 @@ import {
 } from '@kerala-tourism/constants';
 import {
   BadRequestError,
+  ConflictError,
 } from '../../shared/errors/AppError';
 import { IPaymentProvider } from './providers/payment-provider.interface';
 import { PaymentProviderFactory } from './providers/payment-provider.factory';
@@ -162,19 +163,84 @@ export class WebhookService {
     }
 
     try {
-      // Dispatch refund events
-      if (event === 'refund.processed') {
-        return await this.handleRefundProcessed(
-          payload,
-          providerEventId,
-          webhookEventRecord,
-          providerRefundId,
-          providerPaymentId,
-          providerOrderId,
-        );
-      }
+      // Dispatch refund events with strict payload validation
+      if (event === 'refund.processed' || event === 'refund.failed') {
+        const refundAmount = refundEntity?.amount;
+        const refundCurrency = refundEntity?.currency || paymentEntity?.currency;
 
-      if (event === 'refund.failed') {
+        if (!providerRefundId || typeof providerRefundId !== 'string') {
+          await this.repo.updateWebhookEventStatus(
+            webhookEventRecord._id,
+            PAYMENT_WEBHOOK_STATUSES.FAILED,
+            'MISSING_PROVIDER_REFUND_ID',
+          );
+          return {
+            received: true,
+            event,
+            eventId: providerEventId,
+            status: 'FAILED',
+          };
+        }
+
+        if (!providerPaymentId || typeof providerPaymentId !== 'string') {
+          await this.repo.updateWebhookEventStatus(
+            webhookEventRecord._id,
+            PAYMENT_WEBHOOK_STATUSES.FAILED,
+            'MISSING_PROVIDER_PAYMENT_ID',
+          );
+          return {
+            received: true,
+            event,
+            eventId: providerEventId,
+            status: 'FAILED',
+          };
+        }
+
+        if (
+          refundAmount === undefined ||
+          refundAmount === null ||
+          typeof refundAmount !== 'number' ||
+          !Number.isInteger(refundAmount) ||
+          refundAmount <= 0
+        ) {
+          await this.repo.updateWebhookEventStatus(
+            webhookEventRecord._id,
+            PAYMENT_WEBHOOK_STATUSES.FAILED,
+            'MISSING_REFUND_AMOUNT',
+          );
+          return {
+            received: true,
+            event,
+            eventId: providerEventId,
+            status: 'FAILED',
+          };
+        }
+
+        if (!refundCurrency || typeof refundCurrency !== 'string') {
+          await this.repo.updateWebhookEventStatus(
+            webhookEventRecord._id,
+            PAYMENT_WEBHOOK_STATUSES.FAILED,
+            'MISSING_CURRENCY',
+          );
+          return {
+            received: true,
+            event,
+            eventId: providerEventId,
+            status: 'FAILED',
+          };
+        }
+
+        if (event === 'refund.processed') {
+          return await this.handleRefundProcessed(
+            payload,
+            providerEventId,
+            webhookEventRecord,
+            providerRefundId,
+            providerPaymentId,
+            providerOrderId,
+          );
+        }
+
         return await this.handleRefundFailed(
           payload,
           providerEventId,
@@ -390,18 +456,18 @@ export class WebhookService {
   private async findTargetRefund(
     providerRefundId?: string,
     refundEntity?: any,
-    paymentId?: Types.ObjectId | string,
+    session?: ClientSession,
   ): Promise<IRefundLean | null> {
     // 1. Try finding by providerRefundId
     if (providerRefundId) {
-      const byProviderId = await this.refundsRepo.findRefundByProviderRefundId(providerRefundId);
+      const byProviderId = await this.refundsRepo.findRefundByProviderRefundId(providerRefundId, session);
       if (byProviderId) return byProviderId;
     }
 
     // 2. Try finding by refundReference in notes or receipt
     const refFromNotes = refundEntity?.notes?.refundReference;
     if (refFromNotes) {
-      const byRef = await this.refundsRepo.findRefundByReference(refFromNotes);
+      const byRef = await this.refundsRepo.findRefundByReference(refFromNotes, session);
       if (byRef) return byRef;
     }
 
@@ -409,22 +475,12 @@ export class WebhookService {
     if (receipt) {
       const cleanedReceipt = typeof receipt === 'string' ? receipt.replace(/^rcpt_/, '') : '';
       if (cleanedReceipt) {
-        const byReceipt = await this.refundsRepo.findRefundByReference(cleanedReceipt);
+        const byReceipt = await this.refundsRepo.findRefundByReference(cleanedReceipt, session);
         if (byReceipt) return byReceipt;
       }
     }
 
-    // 3. Fallback: If paymentId is available, find a PENDING or PROCESSING refund for this payment
-    if (paymentId) {
-      const refunds = await this.refundsRepo.listRefundsByPaymentId(paymentId);
-      const pendingRefund = refunds.find(
-        (r) =>
-          (r.status === REFUND_STATUSES.PENDING || r.status === REFUND_STATUSES.PROCESSING) &&
-          (refundEntity?.amount === undefined || r.amountPaise === refundEntity.amount),
-      );
-      if (pendingRefund) return pendingRefund;
-    }
-
+    // Prohibit ambiguous matching on paymentId
     return null;
   }
 
@@ -432,8 +488,8 @@ export class WebhookService {
     payload: any,
     providerEventId: string,
     webhookEventRecord: IPaymentWebhookEventLean,
-    providerRefundId?: string,
-    providerPaymentId?: string,
+    providerRefundId: string,
+    providerPaymentId: string,
     providerOrderId?: string,
   ): Promise<PaymentWebhookResultDto> {
     const refundEntity = payload.payload?.refund?.entity;
@@ -451,8 +507,8 @@ export class WebhookService {
       payment = await this.repo.findPaymentByBookingId(refundEntity.notes.bookingId);
     }
 
-    // 2. Locate Refund Record
-    const refund = await this.findTargetRefund(providerRefundId, refundEntity, payment?._id);
+    // 2. Locate Refund Record (deterministic only)
+    const refund = await this.findTargetRefund(providerRefundId, refundEntity);
 
     if (!refund) {
       await this.repo.updateWebhookEventStatus(
@@ -540,7 +596,7 @@ export class WebhookService {
       };
     }
 
-    // 5. Check Idempotency & Conflict Guard
+    // 5. Pre-transaction Idempotency & Conflict Check
     if (refund.status === REFUND_STATUSES.PROCESSED) {
       await this.repo.updateWebhookEventStatus(
         webhookEventRecord._id,
@@ -568,25 +624,108 @@ export class WebhookService {
       };
     }
 
-    // 6. Atomic State Transition
     const processedAt = refundEntity?.created_at
       ? new Date(refundEntity.created_at * 1000)
       : new Date();
 
-    const updatedRefund = await this.refundsRepo.transitionRefundStatus(
-      refund._id,
-      [REFUND_STATUSES.PENDING, REFUND_STATUSES.PROCESSING],
-      REFUND_STATUSES.PROCESSED,
-      {
-        providerRefundId: providerRefundId || refund.providerRefundId,
-        processedAt,
-      },
-    );
+    // 6. Execute Multi-Document ACID Transaction
+    let transactionResult: {
+      settledPayment: IPaymentLean;
+      isFullyRefunded: boolean;
+      updatedRefund: IRefundLean;
+    };
 
-    if (!updatedRefund) {
-      // Check if another concurrent thread transitioned it to PROCESSED
-      const current = await this.refundsRepo.findRefundById(refund._id);
-      if (current?.status === REFUND_STATUSES.PROCESSED) {
+    try {
+      transactionResult = await this.repo.withTransaction(async (session) => {
+        // Re-read and verify refund state within transaction session
+        const currentRefund = await this.refundsRepo.findRefundById(refund._id, session);
+        if (!currentRefund) {
+          throw new ConflictError('Refund record disappeared during transaction', 'REFUND_NOT_FOUND');
+        }
+        if (currentRefund.status === REFUND_STATUSES.PROCESSED) {
+          throw new ConflictError('Refund already processed in concurrent transaction', 'ALREADY_PROCESSED');
+        }
+        if (currentRefund.status !== REFUND_STATUSES.PENDING && currentRefund.status !== REFUND_STATUSES.PROCESSING) {
+          throw new ConflictError(
+            `Refund is in non-processable state: ${currentRefund.status}`,
+            'REFUND_INVALID_STATE',
+          );
+        }
+
+        // 6a. Atomic Refund State Transition
+        const updated = await this.refundsRepo.transitionRefundStatus(
+          refund._id,
+          [REFUND_STATUSES.PENDING, REFUND_STATUSES.PROCESSING],
+          REFUND_STATUSES.PROCESSED,
+          {
+            providerRefundId: providerRefundId || refund.providerRefundId,
+            processedAt,
+          },
+          session,
+        );
+
+        if (!updated) {
+          throw new ConflictError(
+            'Failed to transition refund status atomically',
+            'CONCURRENT_TRANSITION_CONFLICT',
+          );
+        }
+
+        // 6b. Atomic Payment Balance Settlement
+        const settled = await this.repo.settleRefundBalance(
+          payment._id,
+          refund.amountPaise,
+          providerRefundId || refund._id.toString(),
+          refund.reason,
+          session,
+        );
+
+        if (!settled) {
+          throw new ConflictError('Failed to settle payment balance', 'SETTLEMENT_FAILED');
+        }
+
+        const isFully =
+          settled.status === PAYMENT_STATUSES.REFUNDED ||
+          (settled.cumulativeRefundedPaise || 0) >= payment.amountPaise;
+
+        // 6c. Booking & Inventory Safety (Full Refund Only)
+        if (isFully) {
+          const booking = await this.bookingsRepo.findBookingById(payment.bookingId);
+          if (
+            booking &&
+            booking.status !== BOOKING_STATUSES.CANCELLED &&
+            booking.status !== BOOKING_STATUSES.EXPIRED
+          ) {
+            await this.bookingsRepo.updateBooking(
+              booking._id,
+              { status: BOOKING_STATUSES.CANCELLED },
+              session,
+            );
+
+            // Zero phantom inventory check: only release hold if hold was CONSUMED
+            const hold = await this.bookingsRepo.findHoldById(payment.holdId);
+            if (hold && hold.status === INVENTORY_HOLD_STATUSES.CONSUMED) {
+              await this.bookingsRepo.releaseHold(payment.holdId, undefined, session, true);
+            }
+          }
+        }
+
+        // 6d. Mark webhook event processed within the same transaction
+        await this.repo.updateWebhookEventStatus(
+          webhookEventRecord._id,
+          PAYMENT_WEBHOOK_STATUSES.PROCESSED,
+          null,
+          session,
+        );
+
+        return {
+          settledPayment: settled,
+          isFullyRefunded: isFully,
+          updatedRefund: updated,
+        };
+      });
+    } catch (txError: any) {
+      if (txError?.code === 'ALREADY_PROCESSED') {
         await this.repo.updateWebhookEventStatus(
           webhookEventRecord._id,
           PAYMENT_WEBHOOK_STATUSES.PROCESSED,
@@ -598,52 +737,48 @@ export class WebhookService {
           status: 'ALREADY_PROCESSED',
         };
       }
-      await this.repo.updateWebhookEventStatus(
-        webhookEventRecord._id,
-        PAYMENT_WEBHOOK_STATUSES.FAILED,
-        'CONCURRENT_TRANSITION_CONFLICT',
-      );
-      return {
-        received: true,
-        event: payload.event,
-        eventId: providerEventId,
-        status: 'CONFLICT',
-      };
-    }
 
-    // 7. Atomic Payment Balance Settlement
-    const settledPayment = await this.repo.settleRefundBalance(
-      payment._id,
-      refund.amountPaise,
-      providerRefundId || refund._id.toString(),
-      refund.reason,
-    );
-
-    const isFullyRefunded =
-      settledPayment?.status === PAYMENT_STATUSES.REFUNDED ||
-      (settledPayment?.cumulativeRefundedPaise || 0) >= payment.amountPaise;
-
-    // 8. Booking & Inventory Safety (Full Refund Only)
-    if (isFullyRefunded) {
-      const booking = await this.bookingsRepo.findBookingById(payment.bookingId);
       if (
-        booking &&
-        booking.status !== BOOKING_STATUSES.CANCELLED &&
-        booking.status !== BOOKING_STATUSES.EXPIRED
+        txError instanceof ConflictError ||
+        txError?.name === 'ConflictError' ||
+        txError?.code === 'CONCURRENT_TRANSITION_CONFLICT' ||
+        txError?.code === 'INSUFFICIENT_PENDING_REFUND_BALANCE' ||
+        txError?.code === 'EXCESS_CUMULATIVE_REFUND' ||
+        txError?.code === 'REFUND_INVALID_STATE'
       ) {
-        await this.bookingsRepo.updateBooking(booking._id, {
-          status: BOOKING_STATUSES.CANCELLED,
-        });
-
-        // Zero phantom inventory check: only release hold if hold was CONSUMED
-        const hold = await this.bookingsRepo.findHoldById(payment.holdId);
-        if (hold && hold.status === INVENTORY_HOLD_STATUSES.CONSUMED) {
-          await this.bookingsRepo.releaseHold(payment.holdId);
+        // Check if concurrent thread already processed it
+        const current = await this.refundsRepo.findRefundById(refund._id);
+        if (current?.status === REFUND_STATUSES.PROCESSED) {
+          await this.repo.updateWebhookEventStatus(
+            webhookEventRecord._id,
+            PAYMENT_WEBHOOK_STATUSES.PROCESSED,
+          );
+          return {
+            received: true,
+            event: payload.event,
+            eventId: providerEventId,
+            status: 'ALREADY_PROCESSED',
+          };
         }
+
+        await this.repo.updateWebhookEventStatus(
+          webhookEventRecord._id,
+          PAYMENT_WEBHOOK_STATUSES.FAILED,
+          txError.code || 'CONFLICT',
+        );
+        return {
+          received: true,
+          event: payload.event,
+          eventId: providerEventId,
+          status: 'CONFLICT',
+        };
       }
+
+      // Operational/Database system error -> rethrow to trigger 500 and provider retry
+      throw txError;
     }
 
-    // 9. Immutable Audit Logging
+    // 7. Post-Commit Phase: Immutable Audit Logging
     await this.auditService.recordAdminAction({
       actorAccountId: payment.touristAccountId,
       actorAccountType: 'TOURIST',
@@ -658,13 +793,13 @@ export class WebhookService {
       },
       afterState: {
         refundStatus: REFUND_STATUSES.PROCESSED,
-        paymentStatus: settledPayment?.status || (isFullyRefunded ? PAYMENT_STATUSES.REFUNDED : PAYMENT_STATUSES.CAPTURED),
+        paymentStatus: transactionResult.settledPayment.status,
         providerRefundId: providerRefundId || refund.providerRefundId,
-        cumulativeRefundedPaise: settledPayment?.cumulativeRefundedPaise,
+        cumulativeRefundedPaise: transactionResult.settledPayment.cumulativeRefundedPaise,
       },
     });
 
-    // 10. Guest Notification Dispatch
+    // 8. Post-Commit Phase: Guest Notification Dispatch
     await this.notifService
       .publishEvent({
         recipientAccountId: payment.touristAccountId.toString(),
@@ -683,12 +818,6 @@ export class WebhookService {
       })
       .catch((err) => console.error('[Notification Publish Error]:', err));
 
-    // 11. Complete Webhook Event
-    await this.repo.updateWebhookEventStatus(
-      webhookEventRecord._id,
-      PAYMENT_WEBHOOK_STATUSES.PROCESSED,
-    );
-
     return {
       received: true,
       event: payload.event,
@@ -701,8 +830,8 @@ export class WebhookService {
     payload: any,
     providerEventId: string,
     webhookEventRecord: IPaymentWebhookEventLean,
-    providerRefundId?: string,
-    providerPaymentId?: string,
+    providerRefundId: string,
+    providerPaymentId: string,
     providerOrderId?: string,
   ): Promise<PaymentWebhookResultDto> {
     const refundEntity = payload.payload?.refund?.entity;
@@ -720,8 +849,8 @@ export class WebhookService {
       payment = await this.repo.findPaymentByBookingId(refundEntity.notes.bookingId);
     }
 
-    // 2. Locate Refund Record
-    const refund = await this.findTargetRefund(providerRefundId, refundEntity, payment?._id);
+    // 2. Locate Refund Record (deterministic only)
+    const refund = await this.findTargetRefund(providerRefundId, refundEntity);
 
     if (!refund) {
       await this.repo.updateWebhookEventStatus(
@@ -838,23 +967,80 @@ export class WebhookService {
       };
     }
 
-    // 6. Atomic State Transition
     const failureCode = refundEntity?.error_code || 'REFUND_FAILED';
     const failureDescription = refundEntity?.error_description || 'Refund failed at provider';
 
-    const updatedRefund = await this.refundsRepo.transitionRefundStatus(
-      refund._id,
-      [REFUND_STATUSES.PENDING, REFUND_STATUSES.PROCESSING],
-      REFUND_STATUSES.FAILED,
-      {
-        failureCode,
-        failureDescription,
-      },
-    );
+    // 6. Execute Multi-Document ACID Transaction
+    let transactionResult: {
+      releasedPayment: IPaymentLean;
+      updatedRefund: IRefundLean;
+    };
 
-    if (!updatedRefund) {
-      const current = await this.refundsRepo.findRefundById(refund._id);
-      if (current?.status === REFUND_STATUSES.FAILED) {
+    try {
+      transactionResult = await this.repo.withTransaction(async (session) => {
+        // Re-read and verify refund state within transaction session
+        const currentRefund = await this.refundsRepo.findRefundById(refund._id, session);
+        if (!currentRefund) {
+          throw new ConflictError('Refund record disappeared during transaction', 'REFUND_NOT_FOUND');
+        }
+        if (currentRefund.status === REFUND_STATUSES.FAILED) {
+          throw new ConflictError('Refund already failed in concurrent transaction', 'ALREADY_FAILED');
+        }
+        if (currentRefund.status === REFUND_STATUSES.PROCESSED) {
+          throw new ConflictError('Cannot fail an already processed refund', 'CANNOT_FAIL_PROCESSED_REFUND');
+        }
+        if (currentRefund.status !== REFUND_STATUSES.PENDING && currentRefund.status !== REFUND_STATUSES.PROCESSING) {
+          throw new ConflictError(
+            `Refund is in non-failurable state: ${currentRefund.status}`,
+            'REFUND_INVALID_STATE',
+          );
+        }
+
+        // 6a. Atomic Refund State Transition
+        const updated = await this.refundsRepo.transitionRefundStatus(
+          refund._id,
+          [REFUND_STATUSES.PENDING, REFUND_STATUSES.PROCESSING],
+          REFUND_STATUSES.FAILED,
+          {
+            failureCode,
+            failureDescription,
+          },
+          session,
+        );
+
+        if (!updated) {
+          throw new ConflictError(
+            'Failed to transition refund status atomically',
+            'CONCURRENT_TRANSITION_CONFLICT',
+          );
+        }
+
+        // 6b. Atomic Payment Balance Release
+        const released = await this.repo.releaseRefundBalance(
+          payment._id,
+          refund.amountPaise,
+          session,
+        );
+
+        if (!released) {
+          throw new ConflictError('Failed to release payment refund balance', 'RELEASE_FAILED');
+        }
+
+        // 6c. Mark webhook event processed within the same transaction
+        await this.repo.updateWebhookEventStatus(
+          webhookEventRecord._id,
+          PAYMENT_WEBHOOK_STATUSES.PROCESSED,
+          null,
+          session,
+        );
+
+        return {
+          releasedPayment: released,
+          updatedRefund: updated,
+        };
+      });
+    } catch (txError: any) {
+      if (txError?.code === 'ALREADY_FAILED') {
         await this.repo.updateWebhookEventStatus(
           webhookEventRecord._id,
           PAYMENT_WEBHOOK_STATUSES.PROCESSED,
@@ -866,26 +1052,48 @@ export class WebhookService {
           status: 'ALREADY_FAILED',
         };
       }
-      await this.repo.updateWebhookEventStatus(
-        webhookEventRecord._id,
-        PAYMENT_WEBHOOK_STATUSES.FAILED,
-        'CONCURRENT_TRANSITION_CONFLICT',
-      );
-      return {
-        received: true,
-        event: payload.event,
-        eventId: providerEventId,
-        status: 'CONFLICT',
-      };
+
+      if (
+        txError instanceof ConflictError ||
+        txError?.name === 'ConflictError' ||
+        txError?.code === 'CONCURRENT_TRANSITION_CONFLICT' ||
+        txError?.code === 'CANNOT_FAIL_PROCESSED_REFUND' ||
+        txError?.code === 'INSUFFICIENT_PENDING_REFUND_BALANCE' ||
+        txError?.code === 'REFUND_INVALID_STATE'
+      ) {
+        // Check if concurrent thread already failed it
+        const current = await this.refundsRepo.findRefundById(refund._id);
+        if (current?.status === REFUND_STATUSES.FAILED) {
+          await this.repo.updateWebhookEventStatus(
+            webhookEventRecord._id,
+            PAYMENT_WEBHOOK_STATUSES.PROCESSED,
+          );
+          return {
+            received: true,
+            event: payload.event,
+            eventId: providerEventId,
+            status: 'ALREADY_FAILED',
+          };
+        }
+
+        await this.repo.updateWebhookEventStatus(
+          webhookEventRecord._id,
+          PAYMENT_WEBHOOK_STATUSES.FAILED,
+          txError.code || 'CONFLICT',
+        );
+        return {
+          received: true,
+          event: payload.event,
+          eventId: providerEventId,
+          status: 'CONFLICT',
+        };
+      }
+
+      // Operational/Database system error -> rethrow to trigger 500 and provider retry
+      throw txError;
     }
 
-    // 7. Release Reserved Refund Balance
-    const releasedPayment = await this.repo.releaseRefundBalance(
-      payment._id,
-      refund.amountPaise,
-    );
-
-    // 8. Immutable Audit Logging
+    // 7. Post-Commit Phase: Immutable Audit Logging
     await this.auditService.recordAdminAction({
       actorAccountId: payment.touristAccountId,
       actorAccountType: 'TOURIST',
@@ -900,11 +1108,11 @@ export class WebhookService {
       afterState: {
         refundStatus: REFUND_STATUSES.FAILED,
         failureCode,
-        paymentStatus: releasedPayment?.status || payment.status,
+        paymentStatus: transactionResult.releasedPayment.status,
       },
     });
 
-    // 9. Guest Notification Dispatch
+    // 8. Post-Commit Phase: Guest Notification Dispatch
     await this.notifService
       .publishEvent({
         recipientAccountId: payment.touristAccountId.toString(),
@@ -923,12 +1131,6 @@ export class WebhookService {
         idempotencyKey: `evt_rfnd_fail_${refund._id.toString()}`,
       })
       .catch((err) => console.error('[Notification Publish Error]:', err));
-
-    // 10. Complete Webhook Event
-    await this.repo.updateWebhookEventStatus(
-      webhookEventRecord._id,
-      PAYMENT_WEBHOOK_STATUSES.PROCESSED,
-    );
 
     return {
       received: true,

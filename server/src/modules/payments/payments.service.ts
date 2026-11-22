@@ -875,7 +875,7 @@ export class PaymentsService {
           // Check if inventory was consumed and release if needed
           const hold = await this.bookingsRepo.findHoldById(payment.holdId);
           if (hold && hold.status === INVENTORY_HOLD_STATUSES.CONSUMED) {
-            await this.bookingsRepo.releaseHold(payment.holdId);
+            await this.bookingsRepo.releaseHold(payment.holdId, undefined, undefined, true);
           }
         }
       }
