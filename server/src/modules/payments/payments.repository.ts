@@ -57,6 +57,10 @@ export class PaymentsRepository {
   public inMemoryBookingsRef?: Map<string, IBookingLean>;
   public inMemoryHoldsRef?: Map<string, IInventoryHoldLean>;
   public refundsRepoRef?: { inMemoryRefunds: Map<string, any> };
+  public inMemoryNotificationsRef?: Map<string, any>;
+  public inMemoryOutboxRef?: Map<string, any>;
+  public inMemoryAuditLogsRef?: any[];
+  public simulateUnknownCommitResultCount: number = 0;
   private inMemoryTxLock: Promise<void> = Promise.resolve();
 
   public setBookingMemoryStores(
@@ -69,6 +73,18 @@ export class PaymentsRepository {
 
   public setRefundsRepositoryRef(repo: { inMemoryRefunds: Map<string, any> }): void {
     this.refundsRepoRef = repo;
+  }
+
+  public setNotificationMemoryStores(
+    notifications: Map<string, any>,
+    outbox: Map<string, any>,
+  ): void {
+    this.inMemoryNotificationsRef = notifications;
+    this.inMemoryOutboxRef = outbox;
+  }
+
+  public setAuditMemoryStore(logs: any[]): void {
+    this.inMemoryAuditLogsRef = logs;
   }
 
   public async withTransaction<T>(fn: (session?: ClientSession) => Promise<T>): Promise<T> {
@@ -93,108 +109,147 @@ export class PaymentsRepository {
       await previousLock;
 
       try {
-        // Snapshot in-memory maps to support transactional rollback simulation in tests
-        const paymentsSnapshot = new Map(
-          Array.from(this.inMemoryPayments.entries()).map(([k, v]) => [k, { ...v }]),
-        );
-        const refundsSnapshot = this.refundsRepoRef
-          ? new Map(
-              Array.from(this.refundsRepoRef.inMemoryRefunds.entries()).map(([k, v]) => [k, { ...v }]),
-            )
-          : null;
-        const bookingsSnapshot = this.inMemoryBookingsRef
-          ? new Map(
-              Array.from(this.inMemoryBookingsRef.entries()).map(([k, v]) => [k, { ...v }]),
-            )
-          : null;
-        const holdsSnapshot = this.inMemoryHoldsRef
-          ? new Map(
-              Array.from(this.inMemoryHoldsRef.entries()).map(([k, v]) => [k, { ...v }]),
-            )
-          : null;
-        const webhookEventsSnapshot = new Map(
-          Array.from(this.inMemoryWebhookEvents.entries()).map(([k, v]) => [k, { ...v }]),
-        );
+        for (let attempt = 1; attempt <= MAX_TX_RETRIES; attempt++) {
+          // Snapshot in-memory maps to support transactional rollback simulation in tests
+          const paymentsSnapshot = new Map(
+            Array.from(this.inMemoryPayments.entries()).map(([k, v]) => [k, { ...v }]),
+          );
+          const refundsSnapshot = this.refundsRepoRef
+            ? new Map(
+                Array.from(this.refundsRepoRef.inMemoryRefunds.entries()).map(([k, v]) => [k, { ...v }]),
+              )
+            : null;
+          const bookingsSnapshot = this.inMemoryBookingsRef
+            ? new Map(
+                Array.from(this.inMemoryBookingsRef.entries()).map(([k, v]) => [k, { ...v }]),
+              )
+            : null;
+          const holdsSnapshot = this.inMemoryHoldsRef
+            ? new Map(
+                Array.from(this.inMemoryHoldsRef.entries()).map(([k, v]) => [k, { ...v }]),
+              )
+            : null;
+          const webhookEventsSnapshot = new Map(
+            Array.from(this.inMemoryWebhookEvents.entries()).map(([k, v]) => [k, { ...v }]),
+          );
+          const notifsSnapshot = this.inMemoryNotificationsRef
+            ? new Map(
+                Array.from(this.inMemoryNotificationsRef.entries()).map(([k, v]) => [k, { ...v }]),
+              )
+            : null;
+          const outboxSnapshot = this.inMemoryOutboxRef
+            ? new Map(
+                Array.from(this.inMemoryOutboxRef.entries()).map(([k, v]) => [k, { ...v }]),
+              )
+            : null;
+          const auditLogsSnapshot = this.inMemoryAuditLogsRef
+            ? [...this.inMemoryAuditLogsRef]
+            : null;
 
-        try {
-          return await fn(undefined);
-        } catch (txError: unknown) {
-          // Rollback in-memory stores on failure
-          this.inMemoryPayments.clear();
-          for (const [k, v] of paymentsSnapshot) {
-            this.inMemoryPayments.set(k, v);
-          }
+          try {
+            const res = await fn(undefined);
 
-          if (refundsSnapshot && this.refundsRepoRef) {
-            this.refundsRepoRef.inMemoryRefunds.clear();
-            for (const [k, v] of refundsSnapshot) {
-              this.refundsRepoRef.inMemoryRefunds.set(k, v);
+            // Handle simulated UnknownTransactionCommitResult recovery in tests
+            if (this.simulateUnknownCommitResultCount > 0) {
+              this.simulateUnknownCommitResultCount--;
+              // In driver commit recovery semantics, commit is acknowledged without re-executing fn
             }
-          }
 
-          if (bookingsSnapshot && this.inMemoryBookingsRef) {
-            this.inMemoryBookingsRef.clear();
-            for (const [k, v] of bookingsSnapshot) {
-              this.inMemoryBookingsRef.set(k, v);
+            return res;
+          } catch (txError: unknown) {
+            // Rollback in-memory stores on failure
+            this.inMemoryPayments.clear();
+            for (const [k, v] of paymentsSnapshot) {
+              this.inMemoryPayments.set(k, v);
             }
-          }
 
-          if (holdsSnapshot && this.inMemoryHoldsRef) {
-            this.inMemoryHoldsRef.clear();
-            for (const [k, v] of holdsSnapshot) {
-              this.inMemoryHoldsRef.set(k, v);
+            if (refundsSnapshot && this.refundsRepoRef) {
+              this.refundsRepoRef.inMemoryRefunds.clear();
+              for (const [k, v] of refundsSnapshot) {
+                this.refundsRepoRef.inMemoryRefunds.set(k, v);
+              }
             }
-          }
 
-          this.inMemoryWebhookEvents.clear();
-          for (const [k, v] of webhookEventsSnapshot) {
-            this.inMemoryWebhookEvents.set(k, v);
-          }
+            if (bookingsSnapshot && this.inMemoryBookingsRef) {
+              this.inMemoryBookingsRef.clear();
+              for (const [k, v] of bookingsSnapshot) {
+                this.inMemoryBookingsRef.set(k, v);
+              }
+            }
 
-          throw txError;
+            if (holdsSnapshot && this.inMemoryHoldsRef) {
+              this.inMemoryHoldsRef.clear();
+              for (const [k, v] of holdsSnapshot) {
+                this.inMemoryHoldsRef.set(k, v);
+              }
+            }
+
+            this.inMemoryWebhookEvents.clear();
+            for (const [k, v] of webhookEventsSnapshot) {
+              this.inMemoryWebhookEvents.set(k, v);
+            }
+
+            if (notifsSnapshot && this.inMemoryNotificationsRef) {
+              this.inMemoryNotificationsRef.clear();
+              for (const [k, v] of notifsSnapshot) {
+                this.inMemoryNotificationsRef.set(k, v);
+              }
+            }
+
+            if (outboxSnapshot && this.inMemoryOutboxRef) {
+              this.inMemoryOutboxRef.clear();
+              for (const [k, v] of outboxSnapshot) {
+                this.inMemoryOutboxRef.set(k, v);
+              }
+            }
+
+            if (auditLogsSnapshot && this.inMemoryAuditLogsRef) {
+              this.inMemoryAuditLogsRef.length = 0;
+              this.inMemoryAuditLogsRef.push(...auditLogsSnapshot);
+            }
+
+            if (isTransientTransactionError(txError) && attempt < MAX_TX_RETRIES) {
+              await new Promise((resolve) => setTimeout(resolve, attempt * 20));
+              continue;
+            }
+
+            throw txError;
+          }
         }
+
+        throw new InternalServerError(
+          'Transaction failed after maximum retries due to concurrent write conflicts',
+          'TRANSACTION_RETRY_EXHAUSTED',
+        );
       } finally {
         releaseLock!();
       }
     }
 
-    for (let attempt = 1; attempt <= MAX_TX_RETRIES; attempt++) {
-      const session = await mongoose.startSession();
-      try {
-        session.startTransaction();
-        const result = await fn(session);
-        await session.commitTransaction();
-        return result;
-      } catch (txError: unknown) {
-        if (session.inTransaction()) {
-          await session.abortTransaction();
+    // Connected MongoDB replica set mode: use native driver session.withTransaction()
+    // Native withTransaction handles TransientTransactionError and UnknownTransactionCommitResult
+    // commit recovery automatically without double-applying business operations.
+    const session = await mongoose.startSession();
+    try {
+      let result: T;
+      await session.withTransaction(async () => {
+        result = await fn(session);
+      });
+      return result!;
+    } catch (txError: unknown) {
+      if (isUnsupportedTransactionError(txError)) {
+        if (requireTransactions) {
+          throw new InternalServerError(
+            'Payment operations require a MongoDB replica set transaction topology',
+            'TRANSACTION_REQUIRED',
+          );
         }
-
-        if (isUnsupportedTransactionError(txError)) {
-          if (requireTransactions) {
-            throw new InternalServerError(
-              'Payment operations require a MongoDB replica set transaction topology',
-              'TRANSACTION_REQUIRED',
-            );
-          }
-          return await fn(undefined);
-        }
-
-        if (isTransientTransactionError(txError) && attempt < MAX_TX_RETRIES) {
-          await new Promise((resolve) => setTimeout(resolve, attempt * 50));
-          continue;
-        }
-
-        throw txError;
-      } finally {
-        await session.endSession();
+        return await fn(undefined);
       }
+      throw txError;
+    } finally {
+      await session.endSession();
     }
-
-    throw new InternalServerError(
-      'Transaction failed after maximum retries',
-      'TRANSACTION_FAILED',
-    );
   }
 
   public async createPayment(

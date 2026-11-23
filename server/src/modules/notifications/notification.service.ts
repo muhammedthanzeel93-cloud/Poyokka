@@ -1,4 +1,4 @@
-import { Types } from 'mongoose';
+import { Types, ClientSession } from 'mongoose';
 import { NOTIFICATION_TYPES } from '@kerala-tourism/constants';
 import {
   DeviceDto,
@@ -171,6 +171,7 @@ export class NotificationService {
 
   public async publishEvent(
     params: PublishNotificationEventParams,
+    session?: ClientSession,
   ): Promise<{ notificationId?: string; scheduledOutbox: boolean }> {
     // 0. Suppress self-actions (e.g. liking or commenting on one's own post)
     if (
@@ -209,28 +210,34 @@ export class NotificationService {
     }
 
     // 2. Persist in-app Notification record
-    const notif = await this.repo.createNotification({
-      recipientAccountId: params.recipientAccountId,
-      notificationType: params.notificationType,
-      title: params.title,
-      body: params.body,
-      dataPayload: params.dataPayload,
-      relatedResourceType: params.relatedResourceType,
-      relatedResourceId: params.relatedResourceId,
-    });
-
-    // 3. Persist Outbox record with unique idempotencyKey
-    const outboxRecord = await this.repo.createOutboxRecord({
-      notificationId: notif._id,
-      recipientAccountId: params.recipientAccountId,
-      idempotencyKey: params.idempotencyKey,
-      eventType: params.notificationType,
-      payload: {
+    const notif = await this.repo.createNotification(
+      {
+        recipientAccountId: params.recipientAccountId,
+        notificationType: params.notificationType,
         title: params.title,
         body: params.body,
-        data: params.dataPayload,
+        dataPayload: params.dataPayload,
+        relatedResourceType: params.relatedResourceType,
+        relatedResourceId: params.relatedResourceId,
       },
-    });
+      session,
+    );
+
+    // 3. Persist Outbox record with unique idempotencyKey
+    const outboxRecord = await this.repo.createOutboxRecord(
+      {
+        notificationId: notif._id,
+        recipientAccountId: params.recipientAccountId,
+        idempotencyKey: params.idempotencyKey,
+        eventType: params.notificationType,
+        payload: {
+          title: params.title,
+          body: params.body,
+          data: params.dataPayload,
+        },
+      },
+      session,
+    );
 
     return {
       notificationId: notif._id.toString(),

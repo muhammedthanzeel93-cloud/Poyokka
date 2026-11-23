@@ -7,6 +7,7 @@ import path from 'node:path';
 import os from 'node:os';
 import crypto from 'crypto';
 import mongoose, { Types } from 'mongoose';
+import { MongoServerError } from 'mongodb';
 import {
   ACCOUNT_STATUSES,
   ACCOUNT_TYPES,
@@ -33,6 +34,9 @@ import {
   InventoryHoldModel,
   PaymentModel,
   PaymentWebhookEventModel,
+  AuditLogModel,
+  NotificationModel,
+  NotificationOutboxModel,
 } from '../shared/models';
 import { RefundModel } from '../modules/payments/refund.model';
 import { InternalServerError } from '../shared/errors/AppError';
@@ -363,6 +367,9 @@ describe('DAY 24 — Payment Replica Set Integration Tests (ACID Transactions & 
     await PaymentWebhookEventModel.deleteMany({});
     await BookingModel.deleteMany({});
     await InventoryHoldModel.deleteMany({});
+    await RefundModel.deleteMany({});
+    await NotificationModel.deleteMany({});
+    await NotificationOutboxModel.deleteMany({});
   });
 
   // Helper to seed a fresh active booking & hold on MongoDB
@@ -860,6 +867,425 @@ describe('DAY 24 — Payment Replica Set Integration Tests (ACID Transactions & 
       assert.strictEqual(res2.body.data.status, 'PROCESSED');
 
       // 7. Verify post-retry committed state in MongoDB
+      const finalRefund = await RefundModel.findById(refundDoc._id);
+      assert.ok(finalRefund);
+      assert.strictEqual(finalRefund.status, REFUND_STATUSES.PROCESSED);
+
+      const finalPayment = await PaymentModel.findById(paymentId);
+      assert.ok(finalPayment);
+      assert.strictEqual(finalPayment.pendingRefundPaise, 0);
+      assert.strictEqual(finalPayment.cumulativeRefundedPaise, 600000);
+    } finally {
+      paymentsRepository.settleRefundBalance = origSettle;
+    }
+  });
+
+  it('7. Replica Set: Session consistency across Booking, Hold, Payment, Refund, AuditLog, and Outbox in multi-document transaction', async () => {
+    // 1. Create and verify payment on MongoDB replica set
+    const { booking } = await seedBookingAndHold();
+    const initRes = await dispatchRequest(app, 'POST', `/api/v1/tourist/bookings/${booking._id}/payments`, {
+      token: touristToken,
+    });
+    assert.strictEqual(initRes.status, 201);
+    const paymentId = initRes.body.data.payment.id;
+    const orderId = initRes.body.data.checkoutData.orderId;
+    const providerPaymentId = 'pay_replica_sess_07';
+
+    const validSignature = crypto
+      .createHmac('sha256', testKeySecret)
+      .update(`${orderId}|${providerPaymentId}`)
+      .digest('hex');
+
+    await dispatchRequest(app, 'POST', '/api/v1/tourist/payments/verify', {
+      token: touristToken,
+      body: {
+        paymentId,
+        razorpay_order_id: orderId,
+        razorpay_payment_id: providerPaymentId,
+        razorpay_signature: validSignature,
+      },
+    });
+
+    // 2. Persist a PENDING refund doc (full refund of 1,800,000 paise) and reserve pending balance in MongoDB
+    const refundRef = `RFND-${Date.now()}-07`;
+    const providerRefundId = 'rfnd_replica_sess_07';
+    const refundDoc = await RefundModel.create({
+      refundReference: refundRef,
+      paymentId: new Types.ObjectId(paymentId),
+      bookingId: booking._id,
+      touristAccountId: touristId,
+      adminAccountId: new Types.ObjectId(),
+      provider: PAYMENT_PROVIDERS.RAZORPAY,
+      providerPaymentId,
+      providerRefundId,
+      amountPaise: 1800000,
+      currency: 'INR',
+      status: REFUND_STATUSES.PENDING,
+      reason: 'Replica set session consistency test 07',
+    });
+
+    await PaymentModel.updateOne(
+      { _id: new Types.ObjectId(paymentId) },
+      { $set: { pendingRefundPaise: 1800000, cumulativeRefundedPaise: 0 } },
+    );
+
+    // 3. Deliver refund.processed webhook
+    const webhookBody = {
+      event: 'refund.processed',
+      payload: {
+        refund: {
+          entity: {
+            id: providerRefundId,
+            payment_id: providerPaymentId,
+            amount: 1800000,
+            currency: 'INR',
+          },
+        },
+      },
+    };
+    const rawStr = JSON.stringify(webhookBody);
+    const validWebhookSig = crypto
+      .createHmac('sha256', testWebhookSecret)
+      .update(rawStr)
+      .digest('hex');
+
+    const res = await dispatchRequest(app, 'POST', '/api/v1/webhooks/razorpay', {
+      headers: {
+        'x-razorpay-signature': validWebhookSig,
+        'x-razorpay-event-id': 'evt_replica_sess_07',
+        'content-type': 'application/json',
+      },
+      body: webhookBody,
+    });
+
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(res.body.data.status, 'PROCESSED');
+
+    // 4. In MongoDB replica set, verify all transactional mutations committed consistently
+    const committedRefund = await RefundModel.findById(refundDoc._id);
+    assert.ok(committedRefund);
+    assert.strictEqual(committedRefund.status, REFUND_STATUSES.PROCESSED);
+
+    const committedPayment = await PaymentModel.findById(paymentId);
+    assert.ok(committedPayment);
+    assert.strictEqual(committedPayment.pendingRefundPaise, 0);
+    assert.strictEqual(committedPayment.cumulativeRefundedPaise, 1800000);
+
+    const cancelledBooking = await BookingModel.findById(booking._id);
+    assert.ok(cancelledBooking);
+    assert.strictEqual(cancelledBooking.status, BOOKING_STATUSES.CANCELLED);
+
+    // Consumed hold restored
+    const updatedHold = await InventoryHoldModel.findById(booking.holdId);
+    assert.ok(updatedHold);
+    assert.strictEqual(updatedHold.status, INVENTORY_HOLD_STATUSES.RELEASED);
+  });
+
+  it('8. Replica Set: Transactional outbox & audit log are atomically committed inside the multi-document transaction', async () => {
+    const { booking } = await seedBookingAndHold();
+    const initRes = await dispatchRequest(app, 'POST', `/api/v1/tourist/bookings/${booking._id}/payments`, {
+      token: touristToken,
+    });
+    assert.strictEqual(initRes.status, 201);
+    const paymentId = initRes.body.data.payment.id;
+    const orderId = initRes.body.data.checkoutData.orderId;
+    const providerPaymentId = 'pay_replica_outbox_08';
+
+    const validSignature = crypto
+      .createHmac('sha256', testKeySecret)
+      .update(`${orderId}|${providerPaymentId}`)
+      .digest('hex');
+
+    await dispatchRequest(app, 'POST', '/api/v1/tourist/payments/verify', {
+      token: touristToken,
+      body: {
+        paymentId,
+        razorpay_order_id: orderId,
+        razorpay_payment_id: providerPaymentId,
+        razorpay_signature: validSignature,
+      },
+    });
+
+    const refundRef = `RFND-${Date.now()}-08`;
+    const providerRefundId = 'rfnd_replica_outbox_08';
+    await RefundModel.create({
+      refundReference: refundRef,
+      paymentId: new Types.ObjectId(paymentId),
+      bookingId: booking._id,
+      touristAccountId: touristId,
+      adminAccountId: new Types.ObjectId(),
+      provider: PAYMENT_PROVIDERS.RAZORPAY,
+      providerPaymentId,
+      providerRefundId,
+      amountPaise: 600000,
+      currency: 'INR',
+      status: REFUND_STATUSES.PENDING,
+      reason: 'Replica set outbox commit test 08',
+    });
+
+    await PaymentModel.updateOne(
+      { _id: new Types.ObjectId(paymentId) },
+      { $set: { pendingRefundPaise: 600000, cumulativeRefundedPaise: 0 } },
+    );
+
+    const webhookBody = {
+      event: 'refund.processed',
+      payload: {
+        refund: {
+          entity: {
+            id: providerRefundId,
+            payment_id: providerPaymentId,
+            amount: 600000,
+            currency: 'INR',
+          },
+        },
+      },
+    };
+    const rawStr = JSON.stringify(webhookBody);
+    const validWebhookSig = crypto
+      .createHmac('sha256', testWebhookSecret)
+      .update(rawStr)
+      .digest('hex');
+
+    const res = await dispatchRequest(app, 'POST', '/api/v1/webhooks/razorpay', {
+      headers: {
+        'x-razorpay-signature': validWebhookSig,
+        'x-razorpay-event-id': 'evt_replica_outbox_08',
+        'content-type': 'application/json',
+      },
+      body: webhookBody,
+    });
+
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(res.body.data.status, 'PROCESSED');
+
+    // Verify AuditLog was persisted in MongoDB
+    const auditLogs = await AuditLogModel.find({
+      targetEntityType: 'PAYMENT',
+      targetEntityId: new Types.ObjectId(paymentId),
+    });
+    assert.ok(auditLogs.length > 0, 'Audit log persisted in replica set transaction');
+    assert.strictEqual(auditLogs[0].action, 'PAYMENT_REFUNDED');
+
+    // Verify NotificationOutbox was persisted in MongoDB
+    const outboxRecords = await NotificationOutboxModel.find({
+      recipientAccountId: touristId,
+      eventType: 'PAYMENT_REFUNDED',
+    });
+    assert.ok(outboxRecords.length > 0, 'Outbox record persisted in replica set transaction');
+  });
+
+  it('9. Replica Set: Atomic rollback of Outbox and AuditLog when transaction aborts on settlement failure', async () => {
+    const { booking } = await seedBookingAndHold();
+    const initRes = await dispatchRequest(app, 'POST', `/api/v1/tourist/bookings/${booking._id}/payments`, {
+      token: touristToken,
+    });
+    assert.strictEqual(initRes.status, 201);
+    const paymentId = initRes.body.data.payment.id;
+    const orderId = initRes.body.data.checkoutData.orderId;
+    const providerPaymentId = 'pay_replica_rollback_09';
+
+    const validSignature = crypto
+      .createHmac('sha256', testKeySecret)
+      .update(`${orderId}|${providerPaymentId}`)
+      .digest('hex');
+
+    await dispatchRequest(app, 'POST', '/api/v1/tourist/payments/verify', {
+      token: touristToken,
+      body: {
+        paymentId,
+        razorpay_order_id: orderId,
+        razorpay_payment_id: providerPaymentId,
+        razorpay_signature: validSignature,
+      },
+    });
+
+    const refundRef = `RFND-${Date.now()}-09`;
+    const providerRefundId = 'rfnd_replica_rollback_09';
+    const refundDoc = await RefundModel.create({
+      refundReference: refundRef,
+      paymentId: new Types.ObjectId(paymentId),
+      bookingId: booking._id,
+      touristAccountId: touristId,
+      adminAccountId: new Types.ObjectId(),
+      provider: PAYMENT_PROVIDERS.RAZORPAY,
+      providerPaymentId,
+      providerRefundId,
+      amountPaise: 600000,
+      currency: 'INR',
+      status: REFUND_STATUSES.PENDING,
+      reason: 'Replica set rollback test 09',
+    });
+
+    await PaymentModel.updateOne(
+      { _id: new Types.ObjectId(paymentId) },
+      { $set: { pendingRefundPaise: 600000, cumulativeRefundedPaise: 0 } },
+    );
+
+    // Simulate error during settlement
+    const origSettle = paymentsRepository.settleRefundBalance.bind(paymentsRepository);
+    paymentsRepository.settleRefundBalance = async () => {
+      throw new InternalServerError('Simulated DB disconnect in test 09', 'DB_ERROR');
+    };
+
+    const webhookBody = {
+      event: 'refund.processed',
+      payload: {
+        refund: {
+          entity: {
+            id: providerRefundId,
+            payment_id: providerPaymentId,
+            amount: 600000,
+            currency: 'INR',
+          },
+        },
+      },
+    };
+    const rawStr = JSON.stringify(webhookBody);
+    const validWebhookSig = crypto
+      .createHmac('sha256', testWebhookSecret)
+      .update(rawStr)
+      .digest('hex');
+
+    try {
+      const res = await dispatchRequest(app, 'POST', '/api/v1/webhooks/razorpay', {
+        headers: {
+          'x-razorpay-signature': validWebhookSig,
+          'x-razorpay-event-id': 'evt_replica_rollback_09',
+          'content-type': 'application/json',
+        },
+        body: webhookBody,
+      });
+
+      assert.strictEqual(res.status, 500);
+
+      // Verify zero audit logs in MongoDB
+      const auditCount = await AuditLogModel.countDocuments({
+        targetEntityId: new Types.ObjectId(paymentId),
+        action: 'PAYMENT_REFUNDED',
+      });
+      assert.strictEqual(auditCount, 0, 'Zero refund audit logs persisted in aborted transaction');
+
+      // Verify zero outbox records in MongoDB
+      const outboxCount = await NotificationOutboxModel.countDocuments({
+        recipientAccountId: touristId,
+        eventType: 'PAYMENT_REFUNDED',
+      });
+      assert.strictEqual(outboxCount, 0, 'Zero outbox records persisted in aborted transaction');
+
+      // Verify refund document remains PENDING
+      const refund = await RefundModel.findById(refundDoc._id);
+      assert.ok(refund);
+      assert.strictEqual(refund.status, REFUND_STATUSES.PENDING);
+
+      // Verify payment balance intact
+      const payment = await PaymentModel.findById(paymentId);
+      assert.ok(payment);
+      assert.strictEqual(payment.pendingRefundPaise, 600000);
+      assert.strictEqual(payment.cumulativeRefundedPaise, 0);
+    } finally {
+      paymentsRepository.settleRefundBalance = origSettle;
+    }
+  });
+
+  it('10. Replica Set: TransientTransactionError automatically retried by MongoDB driver session.withTransaction()', async () => {
+    const { booking } = await seedBookingAndHold();
+    const initRes = await dispatchRequest(app, 'POST', `/api/v1/tourist/bookings/${booking._id}/payments`, {
+      token: touristToken,
+    });
+    assert.strictEqual(initRes.status, 201);
+    const paymentId = initRes.body.data.payment.id;
+    const orderId = initRes.body.data.checkoutData.orderId;
+    const providerPaymentId = 'pay_replica_transient_10';
+
+    const validSignature = crypto
+      .createHmac('sha256', testKeySecret)
+      .update(`${orderId}|${providerPaymentId}`)
+      .digest('hex');
+
+    await dispatchRequest(app, 'POST', '/api/v1/tourist/payments/verify', {
+      token: touristToken,
+      body: {
+        paymentId,
+        razorpay_order_id: orderId,
+        razorpay_payment_id: providerPaymentId,
+        razorpay_signature: validSignature,
+      },
+    });
+
+    const refundRef = `RFND-${Date.now()}-10`;
+    const providerRefundId = 'rfnd_replica_transient_10';
+    const refundDoc = await RefundModel.create({
+      refundReference: refundRef,
+      paymentId: new Types.ObjectId(paymentId),
+      bookingId: booking._id,
+      touristAccountId: touristId,
+      adminAccountId: new Types.ObjectId(),
+      provider: PAYMENT_PROVIDERS.RAZORPAY,
+      providerPaymentId,
+      providerRefundId,
+      amountPaise: 600000,
+      currency: 'INR',
+      status: REFUND_STATUSES.PENDING,
+      reason: 'Replica set transient retry test 10',
+    });
+
+    await PaymentModel.updateOne(
+      { _id: new Types.ObjectId(paymentId) },
+      { $set: { pendingRefundPaise: 600000, cumulativeRefundedPaise: 0 } },
+    );
+
+    // Simulate TransientTransactionError on attempt 1
+    let attemptCount = 0;
+    const origSettle = paymentsRepository.settleRefundBalance.bind(paymentsRepository);
+    paymentsRepository.settleRefundBalance = async (...args: any[]) => {
+      attemptCount++;
+      if (attemptCount === 1) {
+        const transientErr = new MongoServerError({
+          message: 'WriteConflict during replica set settlement',
+          errmsg: 'WriteConflict',
+          code: 112,
+          codeName: 'WriteConflict',
+        });
+        transientErr.addErrorLabel('TransientTransactionError');
+        throw transientErr;
+      }
+      return origSettle(...(args as [any, any, any, any, any]));
+    };
+
+    const webhookBody = {
+      event: 'refund.processed',
+      payload: {
+        refund: {
+          entity: {
+            id: providerRefundId,
+            payment_id: providerPaymentId,
+            amount: 600000,
+            currency: 'INR',
+          },
+        },
+      },
+    };
+    const rawStr = JSON.stringify(webhookBody);
+    const validWebhookSig = crypto
+      .createHmac('sha256', testWebhookSecret)
+      .update(rawStr)
+      .digest('hex');
+
+    try {
+      const res = await dispatchRequest(app, 'POST', '/api/v1/webhooks/razorpay', {
+        headers: {
+          'x-razorpay-signature': validWebhookSig,
+          'x-razorpay-event-id': 'evt_replica_transient_10',
+          'content-type': 'application/json',
+        },
+        body: webhookBody,
+      });
+
+      assert.strictEqual(res.status, 200);
+      assert.strictEqual(res.body.data.status, 'PROCESSED');
+      assert.strictEqual(attemptCount, 2, 'Transaction retried on TransientTransactionError and succeeded on attempt 2');
+
       const finalRefund = await RefundModel.findById(refundDoc._id);
       assert.ok(finalRefund);
       assert.strictEqual(finalRefund.status, REFUND_STATUSES.PROCESSED);

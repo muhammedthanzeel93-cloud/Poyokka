@@ -23,6 +23,10 @@ import { BookingsRepository, bookingsRepository } from '../bookings/bookings.rep
 import { AuditLogService, auditLogService } from '../admin/audit-log.service';
 import { NotificationService, notificationService } from '../notifications/notification.service';
 import {
+  NotificationDeliveryWorker,
+  notificationDeliveryWorker,
+} from '../notifications/delivery/delivery.worker';
+import {
   PaymentWebhookResultDto,
   IPaymentLean,
   IRefundLean,
@@ -36,6 +40,7 @@ export class WebhookService {
   private provider: IPaymentProvider;
   private auditService: AuditLogService;
   private notifService: NotificationService;
+  private deliveryWorker: NotificationDeliveryWorker;
 
   constructor(
     repo: PaymentsRepository = paymentsRepository,
@@ -44,6 +49,7 @@ export class WebhookService {
     provider: IPaymentProvider = PaymentProviderFactory.getProvider(),
     auditService: AuditLogService = auditLogService,
     notifService: NotificationService = notificationService,
+    deliveryWorker: NotificationDeliveryWorker = notificationDeliveryWorker,
   ) {
     this.repo = repo;
     this.refundsRepo = refundsRepo;
@@ -51,6 +57,11 @@ export class WebhookService {
     this.provider = provider;
     this.auditService = auditService;
     this.notifService = notifService;
+    this.deliveryWorker = deliveryWorker;
+  }
+
+  public setDeliveryWorker(deliveryWorker: NotificationDeliveryWorker): void {
+    this.deliveryWorker = deliveryWorker;
   }
 
   public setRepository(repo: PaymentsRepository): void {
@@ -543,16 +554,28 @@ export class WebhookService {
       };
     }
 
-    // 3. Validate payment identity match
-    if (
-      providerPaymentId &&
-      payment.providerPaymentId &&
-      payment.providerPaymentId !== providerPaymentId
-    ) {
+    // 3. Strict 7-Point Identity Validation
+    // Check 1: Provider Refund ID match (if already recorded)
+    if (refund.providerRefundId && refund.providerRefundId !== providerRefundId) {
       await this.repo.updateWebhookEventStatus(
         webhookEventRecord._id,
         PAYMENT_WEBHOOK_STATUSES.FAILED,
-        'PROVIDER_PAYMENT_ID_MISMATCH',
+        'REFUND_PROVIDER_ID_MISMATCH',
+      );
+      return {
+        received: true,
+        event: payload.event,
+        eventId: providerEventId,
+        status: 'REFUND_PROVIDER_ID_MISMATCH',
+      };
+    }
+
+    // Check 2: Incoming providerPaymentId matches local refund's providerPaymentId
+    if (!refund.providerPaymentId || refund.providerPaymentId !== providerPaymentId) {
+      await this.repo.updateWebhookEventStatus(
+        webhookEventRecord._id,
+        PAYMENT_WEBHOOK_STATUSES.FAILED,
+        'REFUND_PROVIDER_PAYMENT_ID_MISMATCH',
       );
       return {
         received: true,
@@ -562,8 +585,38 @@ export class WebhookService {
       };
     }
 
-    // 4. Validate Amount and Currency
-    if (refundEntity?.amount !== undefined && refundEntity.amount !== refund.amountPaise) {
+    // Check 3: Local refund paymentId matches the resolved local payment _id
+    if (refund.paymentId.toString() !== payment._id.toString()) {
+      await this.repo.updateWebhookEventStatus(
+        webhookEventRecord._id,
+        PAYMENT_WEBHOOK_STATUSES.FAILED,
+        'REFUND_PAYMENT_ID_MISMATCH',
+      );
+      return {
+        received: true,
+        event: payload.event,
+        eventId: providerEventId,
+        status: 'REFUND_PAYMENT_ID_MISMATCH',
+      };
+    }
+
+    // Check 4: Local payment providerPaymentId exists and matches incoming providerPaymentId
+    if (!payment.providerPaymentId || payment.providerPaymentId !== providerPaymentId) {
+      await this.repo.updateWebhookEventStatus(
+        webhookEventRecord._id,
+        PAYMENT_WEBHOOK_STATUSES.FAILED,
+        'PAYMENT_PROVIDER_PAYMENT_ID_MISMATCH',
+      );
+      return {
+        received: true,
+        event: payload.event,
+        eventId: providerEventId,
+        status: 'PAYMENT_MISMATCH',
+      };
+    }
+
+    // Check 5: Refund amount matches exactly in integer paise
+    if (refundEntity?.amount === undefined || refundEntity.amount !== refund.amountPaise) {
       await this.repo.updateWebhookEventStatus(
         webhookEventRecord._id,
         PAYMENT_WEBHOOK_STATUSES.FAILED,
@@ -577,11 +630,14 @@ export class WebhookService {
       };
     }
 
+    // Check 6: Currency matches exactly
     const webhookCurrency = refundEntity?.currency || paymentEntity?.currency;
     if (
-      webhookCurrency &&
-      payment.currency &&
-      webhookCurrency.toUpperCase() !== payment.currency.toUpperCase()
+      !webhookCurrency ||
+      !refund.currency ||
+      !payment.currency ||
+      webhookCurrency.toUpperCase() !== refund.currency.toUpperCase() ||
+      refund.currency.toUpperCase() !== payment.currency.toUpperCase()
     ) {
       await this.repo.updateWebhookEventStatus(
         webhookEventRecord._id,
@@ -596,7 +652,25 @@ export class WebhookService {
       };
     }
 
-    // 5. Pre-transaction Idempotency & Conflict Check
+    // Check 7: Refund provider and payment provider match RAZORPAY
+    if (
+      refund.provider !== PAYMENT_PROVIDERS.RAZORPAY ||
+      payment.provider !== PAYMENT_PROVIDERS.RAZORPAY
+    ) {
+      await this.repo.updateWebhookEventStatus(
+        webhookEventRecord._id,
+        PAYMENT_WEBHOOK_STATUSES.FAILED,
+        'PAYMENT_PROVIDER_MISMATCH',
+      );
+      return {
+        received: true,
+        event: payload.event,
+        eventId: providerEventId,
+        status: 'PAYMENT_PROVIDER_MISMATCH',
+      };
+    }
+
+    // 4. Pre-transaction Idempotency & Conflict Check
     if (refund.status === REFUND_STATUSES.PROCESSED) {
       await this.repo.updateWebhookEventStatus(
         webhookEventRecord._id,
@@ -628,15 +702,9 @@ export class WebhookService {
       ? new Date(refundEntity.created_at * 1000)
       : new Date();
 
-    // 6. Execute Multi-Document ACID Transaction
-    let transactionResult: {
-      settledPayment: IPaymentLean;
-      isFullyRefunded: boolean;
-      updatedRefund: IRefundLean;
-    };
-
+    // 5. Execute Multi-Document ACID Transaction
     try {
-      transactionResult = await this.repo.withTransaction(async (session) => {
+      await this.repo.withTransaction(async (session) => {
         // Re-read and verify refund state within transaction session
         const currentRefund = await this.refundsRepo.findRefundById(refund._id, session);
         if (!currentRefund) {
@@ -652,7 +720,7 @@ export class WebhookService {
           );
         }
 
-        // 6a. Atomic Refund State Transition
+        // 5a. Atomic Refund State Transition
         const updated = await this.refundsRepo.transitionRefundStatus(
           refund._id,
           [REFUND_STATUSES.PENDING, REFUND_STATUSES.PROCESSING],
@@ -671,7 +739,7 @@ export class WebhookService {
           );
         }
 
-        // 6b. Atomic Payment Balance Settlement
+        // 5b. Atomic Payment Balance Settlement
         const settled = await this.repo.settleRefundBalance(
           payment._id,
           refund.amountPaise,
@@ -688,9 +756,9 @@ export class WebhookService {
           settled.status === PAYMENT_STATUSES.REFUNDED ||
           (settled.cumulativeRefundedPaise || 0) >= payment.amountPaise;
 
-        // 6c. Booking & Inventory Safety (Full Refund Only)
+        // 5c. Booking & Inventory Safety (Full Refund Only - Session-Consistent Reads)
         if (isFully) {
-          const booking = await this.bookingsRepo.findBookingById(payment.bookingId);
+          const booking = await this.bookingsRepo.findBookingById(payment.bookingId, session);
           if (
             booking &&
             booking.status !== BOOKING_STATUSES.CANCELLED &&
@@ -703,14 +771,58 @@ export class WebhookService {
             );
 
             // Zero phantom inventory check: only release hold if hold was CONSUMED
-            const hold = await this.bookingsRepo.findHoldById(payment.holdId);
+            const hold = await this.bookingsRepo.findHoldById(payment.holdId, session);
             if (hold && hold.status === INVENTORY_HOLD_STATUSES.CONSUMED) {
               await this.bookingsRepo.releaseHold(payment.holdId, undefined, session, true);
             }
           }
         }
 
-        // 6d. Mark webhook event processed within the same transaction
+        // 5d. Immutable Audit Logging (Durable inside Transaction Session)
+        await this.auditService.recordAdminAction(
+          {
+            actorAccountId: payment.touristAccountId,
+            actorAccountType: 'TOURIST',
+            action: ADMIN_AUDIT_ACTIONS.PAYMENT_REFUNDED,
+            targetEntityId: payment._id,
+            targetEntityType: AUDIT_TARGET_ENTITY_TYPES.PAYMENT,
+            reason: refund.reason || 'Refund processed via Razorpay webhook',
+            beforeState: {
+              refundStatus: refund.status,
+              paymentStatus: payment.status,
+              cumulativeRefundedPaise: payment.cumulativeRefundedPaise,
+            },
+            afterState: {
+              refundStatus: REFUND_STATUSES.PROCESSED,
+              paymentStatus: settled.status,
+              providerRefundId: providerRefundId || refund.providerRefundId,
+              cumulativeRefundedPaise: settled.cumulativeRefundedPaise,
+            },
+          },
+          session,
+        );
+
+        // 5e. Durable Transactional Outbox Notification Persistence
+        await this.notifService.publishEvent(
+          {
+            recipientAccountId: payment.touristAccountId.toString(),
+            notificationType: NOTIFICATION_TYPES.PAYMENT_REFUNDED,
+            title: 'Refund Processed',
+            body: `A refund of ₹${(refund.amountPaise / 100).toFixed(2)} for payment ${payment.paymentReference} has been processed to your original payment method.`,
+            dataPayload: {
+              route: 'booking_details',
+              bookingId: payment.bookingId.toString(),
+              paymentId: payment._id.toString(),
+              refundId: providerRefundId || refund._id.toString(),
+            },
+            relatedResourceType: 'PAYMENT',
+            relatedResourceId: payment._id.toString(),
+            idempotencyKey: `evt_rfnd_proc_${refund._id.toString()}`,
+          },
+          session,
+        );
+
+        // 5f. Mark webhook event processed within the same transaction
         await this.repo.updateWebhookEventStatus(
           webhookEventRecord._id,
           PAYMENT_WEBHOOK_STATUSES.PROCESSED,
@@ -778,45 +890,12 @@ export class WebhookService {
       throw txError;
     }
 
-    // 7. Post-Commit Phase: Immutable Audit Logging
-    await this.auditService.recordAdminAction({
-      actorAccountId: payment.touristAccountId,
-      actorAccountType: 'TOURIST',
-      action: ADMIN_AUDIT_ACTIONS.PAYMENT_REFUNDED,
-      targetEntityId: payment._id,
-      targetEntityType: AUDIT_TARGET_ENTITY_TYPES.PAYMENT,
-      reason: refund.reason || 'Refund processed via Razorpay webhook',
-      beforeState: {
-        refundStatus: refund.status,
-        paymentStatus: payment.status,
-        cumulativeRefundedPaise: payment.cumulativeRefundedPaise,
-      },
-      afterState: {
-        refundStatus: REFUND_STATUSES.PROCESSED,
-        paymentStatus: transactionResult.settledPayment.status,
-        providerRefundId: providerRefundId || refund.providerRefundId,
-        cumulativeRefundedPaise: transactionResult.settledPayment.cumulativeRefundedPaise,
-      },
-    });
-
-    // 8. Post-Commit Phase: Guest Notification Dispatch
-    await this.notifService
-      .publishEvent({
-        recipientAccountId: payment.touristAccountId.toString(),
-        notificationType: NOTIFICATION_TYPES.PAYMENT_REFUNDED,
-        title: 'Refund Processed',
-        body: `A refund of ₹${(refund.amountPaise / 100).toFixed(2)} for payment ${payment.paymentReference} has been processed to your original payment method.`,
-        dataPayload: {
-          route: 'booking_details',
-          bookingId: payment.bookingId.toString(),
-          paymentId: payment._id.toString(),
-          refundId: providerRefundId || refund._id.toString(),
-        },
-        relatedResourceType: 'PAYMENT',
-        relatedResourceId: payment._id.toString(),
-        idempotencyKey: `evt_rfnd_proc_${refund._id.toString()}`,
-      })
-      .catch((err) => console.error('[Notification Publish Error]:', err));
+    // 6. Post-Commit Phase: Immediate non-blocking outbox batch dispatch
+    try {
+      await this.deliveryWorker.processPendingOutboxBatch(1);
+    } catch (workerErr) {
+      // If immediate dispatch fails or process crashes, background worker will pick it up
+    }
 
     return {
       received: true,
@@ -885,16 +964,28 @@ export class WebhookService {
       };
     }
 
-    // 3. Validate payment identity match
-    if (
-      providerPaymentId &&
-      payment.providerPaymentId &&
-      payment.providerPaymentId !== providerPaymentId
-    ) {
+    // 3. Strict 7-Point Identity Validation
+    // Check 1: Provider Refund ID match (if already recorded)
+    if (refund.providerRefundId && refund.providerRefundId !== providerRefundId) {
       await this.repo.updateWebhookEventStatus(
         webhookEventRecord._id,
         PAYMENT_WEBHOOK_STATUSES.FAILED,
-        'PROVIDER_PAYMENT_ID_MISMATCH',
+        'REFUND_PROVIDER_ID_MISMATCH',
+      );
+      return {
+        received: true,
+        event: payload.event,
+        eventId: providerEventId,
+        status: 'REFUND_PROVIDER_ID_MISMATCH',
+      };
+    }
+
+    // Check 2: Incoming providerPaymentId matches local refund's providerPaymentId
+    if (!refund.providerPaymentId || refund.providerPaymentId !== providerPaymentId) {
+      await this.repo.updateWebhookEventStatus(
+        webhookEventRecord._id,
+        PAYMENT_WEBHOOK_STATUSES.FAILED,
+        'REFUND_PROVIDER_PAYMENT_ID_MISMATCH',
       );
       return {
         received: true,
@@ -904,7 +995,37 @@ export class WebhookService {
       };
     }
 
-    // 4. Validate Amount and Currency
+    // Check 3: Local refund paymentId matches the resolved local payment _id
+    if (refund.paymentId.toString() !== payment._id.toString()) {
+      await this.repo.updateWebhookEventStatus(
+        webhookEventRecord._id,
+        PAYMENT_WEBHOOK_STATUSES.FAILED,
+        'REFUND_PAYMENT_ID_MISMATCH',
+      );
+      return {
+        received: true,
+        event: payload.event,
+        eventId: providerEventId,
+        status: 'REFUND_PAYMENT_ID_MISMATCH',
+      };
+    }
+
+    // Check 4: Local payment providerPaymentId exists and matches incoming providerPaymentId
+    if (!payment.providerPaymentId || payment.providerPaymentId !== providerPaymentId) {
+      await this.repo.updateWebhookEventStatus(
+        webhookEventRecord._id,
+        PAYMENT_WEBHOOK_STATUSES.FAILED,
+        'PAYMENT_PROVIDER_PAYMENT_ID_MISMATCH',
+      );
+      return {
+        received: true,
+        event: payload.event,
+        eventId: providerEventId,
+        status: 'PAYMENT_MISMATCH',
+      };
+    }
+
+    // Check 5: Refund amount matches exactly in integer paise
     if (refundEntity?.amount !== undefined && refundEntity.amount !== refund.amountPaise) {
       await this.repo.updateWebhookEventStatus(
         webhookEventRecord._id,
@@ -921,9 +1042,11 @@ export class WebhookService {
 
     const webhookCurrency = refundEntity?.currency || paymentEntity?.currency;
     if (
-      webhookCurrency &&
-      payment.currency &&
-      webhookCurrency.toUpperCase() !== payment.currency.toUpperCase()
+      !webhookCurrency ||
+      !refund.currency ||
+      !payment.currency ||
+      webhookCurrency.toUpperCase() !== refund.currency.toUpperCase() ||
+      refund.currency.toUpperCase() !== payment.currency.toUpperCase()
     ) {
       await this.repo.updateWebhookEventStatus(
         webhookEventRecord._id,
@@ -938,7 +1061,25 @@ export class WebhookService {
       };
     }
 
-    // 5. Check Idempotency & Monotonic Protection
+    // Check 7: Refund provider and payment provider match RAZORPAY
+    if (
+      refund.provider !== PAYMENT_PROVIDERS.RAZORPAY ||
+      payment.provider !== PAYMENT_PROVIDERS.RAZORPAY
+    ) {
+      await this.repo.updateWebhookEventStatus(
+        webhookEventRecord._id,
+        PAYMENT_WEBHOOK_STATUSES.FAILED,
+        'PAYMENT_PROVIDER_MISMATCH',
+      );
+      return {
+        received: true,
+        event: payload.event,
+        eventId: providerEventId,
+        status: 'PAYMENT_PROVIDER_MISMATCH',
+      };
+    }
+
+    // 4. Check Idempotency & Monotonic Protection
     if (refund.status === REFUND_STATUSES.FAILED) {
       await this.repo.updateWebhookEventStatus(
         webhookEventRecord._id,
@@ -970,14 +1111,9 @@ export class WebhookService {
     const failureCode = refundEntity?.error_code || 'REFUND_FAILED';
     const failureDescription = refundEntity?.error_description || 'Refund failed at provider';
 
-    // 6. Execute Multi-Document ACID Transaction
-    let transactionResult: {
-      releasedPayment: IPaymentLean;
-      updatedRefund: IRefundLean;
-    };
-
+    // 5. Execute Multi-Document ACID Transaction
     try {
-      transactionResult = await this.repo.withTransaction(async (session) => {
+      await this.repo.withTransaction(async (session) => {
         // Re-read and verify refund state within transaction session
         const currentRefund = await this.refundsRepo.findRefundById(refund._id, session);
         if (!currentRefund) {
@@ -996,7 +1132,7 @@ export class WebhookService {
           );
         }
 
-        // 6a. Atomic Refund State Transition
+        // 5a. Atomic Refund State Transition
         const updated = await this.refundsRepo.transitionRefundStatus(
           refund._id,
           [REFUND_STATUSES.PENDING, REFUND_STATUSES.PROCESSING],
@@ -1015,7 +1151,7 @@ export class WebhookService {
           );
         }
 
-        // 6b. Atomic Payment Balance Release
+        // 5b. Atomic Payment Balance Release
         const released = await this.repo.releaseRefundBalance(
           payment._id,
           refund.amountPaise,
@@ -1026,7 +1162,50 @@ export class WebhookService {
           throw new ConflictError('Failed to release payment refund balance', 'RELEASE_FAILED');
         }
 
-        // 6c. Mark webhook event processed within the same transaction
+        // 5c. Immutable Audit Logging (Durable inside Transaction Session)
+        await this.auditService.recordAdminAction(
+          {
+            actorAccountId: payment.touristAccountId,
+            actorAccountType: 'TOURIST',
+            action: ADMIN_AUDIT_ACTIONS.PAYMENT_REFUNDED,
+            targetEntityId: payment._id,
+            targetEntityType: AUDIT_TARGET_ENTITY_TYPES.PAYMENT,
+            reason: `Refund failed via Razorpay webhook: ${failureCode} - ${failureDescription}`,
+            beforeState: {
+              refundStatus: refund.status,
+              paymentStatus: payment.status,
+            },
+            afterState: {
+              refundStatus: REFUND_STATUSES.FAILED,
+              failureCode,
+              paymentStatus: released.status,
+            },
+          },
+          session,
+        );
+
+        // 5d. Durable Transactional Outbox Notification Persistence
+        await this.notifService.publishEvent(
+          {
+            recipientAccountId: payment.touristAccountId.toString(),
+            notificationType: NOTIFICATION_TYPES.PAYMENT_REFUNDED,
+            title: 'Refund Failed',
+            body: `The refund of ₹${(refund.amountPaise / 100).toFixed(2)} for payment ${payment.paymentReference} could not be processed. Our support team has been notified.`,
+            dataPayload: {
+              route: 'booking_details',
+              bookingId: payment.bookingId.toString(),
+              paymentId: payment._id.toString(),
+              refundId: refund._id.toString(),
+              failureCode,
+            },
+            relatedResourceType: 'PAYMENT',
+            relatedResourceId: payment._id.toString(),
+            idempotencyKey: `evt_rfnd_fail_${refund._id.toString()}`,
+          },
+          session,
+        );
+
+        // 5e. Mark webhook event processed within the same transaction
         await this.repo.updateWebhookEventStatus(
           webhookEventRecord._id,
           PAYMENT_WEBHOOK_STATUSES.PROCESSED,
@@ -1093,44 +1272,12 @@ export class WebhookService {
       throw txError;
     }
 
-    // 7. Post-Commit Phase: Immutable Audit Logging
-    await this.auditService.recordAdminAction({
-      actorAccountId: payment.touristAccountId,
-      actorAccountType: 'TOURIST',
-      action: ADMIN_AUDIT_ACTIONS.PAYMENT_REFUNDED,
-      targetEntityId: payment._id,
-      targetEntityType: AUDIT_TARGET_ENTITY_TYPES.PAYMENT,
-      reason: `Refund failed via Razorpay webhook: ${failureCode} - ${failureDescription}`,
-      beforeState: {
-        refundStatus: refund.status,
-        paymentStatus: payment.status,
-      },
-      afterState: {
-        refundStatus: REFUND_STATUSES.FAILED,
-        failureCode,
-        paymentStatus: transactionResult.releasedPayment.status,
-      },
-    });
-
-    // 8. Post-Commit Phase: Guest Notification Dispatch
-    await this.notifService
-      .publishEvent({
-        recipientAccountId: payment.touristAccountId.toString(),
-        notificationType: NOTIFICATION_TYPES.PAYMENT_REFUNDED,
-        title: 'Refund Failed',
-        body: `The refund of ₹${(refund.amountPaise / 100).toFixed(2)} for payment ${payment.paymentReference} could not be processed. Our support team has been notified.`,
-        dataPayload: {
-          route: 'booking_details',
-          bookingId: payment.bookingId.toString(),
-          paymentId: payment._id.toString(),
-          refundId: refund._id.toString(),
-          failureCode,
-        },
-        relatedResourceType: 'PAYMENT',
-        relatedResourceId: payment._id.toString(),
-        idempotencyKey: `evt_rfnd_fail_${refund._id.toString()}`,
-      })
-      .catch((err) => console.error('[Notification Publish Error]:', err));
+    // 6. Post-Commit Phase: Immediate non-blocking outbox batch dispatch
+    try {
+      await this.deliveryWorker.processPendingOutboxBatch(1);
+    } catch (workerErr) {
+      // If immediate dispatch fails or process crashes, background worker will pick it up
+    }
 
     return {
       received: true,

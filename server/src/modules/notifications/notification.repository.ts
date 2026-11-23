@@ -43,6 +43,10 @@ export interface CreateOutboxParams {
 }
 
 export class NotificationRepository {
+  public inMemoryNotifications = new Map<string, any>();
+  public inMemoryOutbox = new Map<string, any>();
+  public inMemoryDeviceTokens = new Map<string, any>();
+
   constructor(
     private readonly notifModel: Model<INotificationDocument> = NotificationModel,
     private readonly deviceModel: Model<IDeviceTokenDocument> = DeviceTokenModel,
@@ -61,6 +65,22 @@ export class NotificationRepository {
     deviceId?: string,
   ): Promise<IDeviceTokenDocument> {
     const accId = typeof accountId === 'string' ? new Types.ObjectId(accountId) : accountId;
+
+    if (mongoose.connection.readyState !== 1) {
+      const doc = {
+        _id: new Types.ObjectId(),
+        accountId: accId,
+        deviceToken: deviceToken.trim(),
+        platform,
+        deviceId: deviceId ? deviceId.trim() : undefined,
+        isActive: true,
+        lastSeenAt: new Date(),
+        invalidatedAt: null,
+        invalidReason: undefined,
+      };
+      this.inMemoryDeviceTokens.set(deviceToken.trim(), doc);
+      return doc as unknown as IDeviceTokenDocument;
+    }
 
     const updated = await this.deviceModel.findOneAndUpdate(
       { deviceToken: deviceToken.trim() },
@@ -85,7 +105,14 @@ export class NotificationRepository {
     accountId: Types.ObjectId | string,
   ): Promise<string[]> {
     if (mongoose.connection.readyState !== 1) {
-      return [];
+      const accIdStr = accountId.toString();
+      const tokens: string[] = [];
+      for (const doc of this.inMemoryDeviceTokens.values()) {
+        if (doc.accountId.toString() === accIdStr && doc.isActive) {
+          tokens.push(doc.deviceToken);
+        }
+      }
+      return tokens;
     }
     const accId = typeof accountId === 'string' ? new Types.ObjectId(accountId) : accountId;
     const records = await this.deviceModel
@@ -102,12 +129,30 @@ export class NotificationRepository {
     if (!Types.ObjectId.isValid(deviceId)) {
       return null;
     }
+    if (mongoose.connection.readyState !== 1) {
+      for (const doc of this.inMemoryDeviceTokens.values()) {
+        if (doc._id.toString() === deviceId.toString()) {
+          return doc as unknown as IDeviceTokenDocument;
+        }
+      }
+      return null;
+    }
     return this.deviceModel.findById(deviceId);
   }
 
   public async findDevicesByAccountId(
     accountId: Types.ObjectId | string,
   ): Promise<IDeviceTokenDocument[]> {
+    const accIdStr = accountId.toString();
+    if (mongoose.connection.readyState !== 1) {
+      const res: IDeviceTokenDocument[] = [];
+      for (const doc of this.inMemoryDeviceTokens.values()) {
+        if (doc.accountId.toString() === accIdStr && doc.isActive) {
+          res.push(doc as unknown as IDeviceTokenDocument);
+        }
+      }
+      return res;
+    }
     const accId = typeof accountId === 'string' ? new Types.ObjectId(accountId) : accountId;
     return this.deviceModel
       .find({ accountId: accId, isActive: true })
@@ -123,6 +168,22 @@ export class NotificationRepository {
       return false;
     }
     const accId = typeof accountId === 'string' ? new Types.ObjectId(accountId) : accountId;
+
+    if (mongoose.connection.readyState !== 1) {
+      for (const doc of this.inMemoryDeviceTokens.values()) {
+        if (
+          doc._id.toString() === deviceId.toString() &&
+          doc.accountId.toString() === accId.toString() &&
+          doc.isActive
+        ) {
+          doc.isActive = false;
+          doc.invalidatedAt = new Date();
+          doc.invalidReason = reason;
+          return true;
+        }
+      }
+      return false;
+    }
 
     const res = await this.deviceModel.updateOne(
       { _id: deviceId, accountId: accId, isActive: true },
@@ -143,6 +204,20 @@ export class NotificationRepository {
     reason: string = 'FCM_UNREGISTERED',
   ): Promise<number> {
     if (tokens.length === 0) return 0;
+
+    if (mongoose.connection.readyState !== 1) {
+      let count = 0;
+      for (const token of tokens) {
+        const doc = this.inMemoryDeviceTokens.get(token);
+        if (doc && doc.isActive) {
+          doc.isActive = false;
+          doc.invalidatedAt = new Date();
+          doc.invalidReason = reason;
+          count++;
+        }
+      }
+      return count;
+    }
 
     const res = await this.deviceModel.updateMany(
       { deviceToken: { $in: tokens } },
@@ -172,7 +247,7 @@ export class NotificationRepository {
         : params.recipientAccountId;
 
     if (mongoose.connection.readyState !== 1) {
-      return {
+      const doc = {
         _id: new Types.ObjectId(),
         recipientAccountId: recipientId,
         notificationType: params.notificationType,
@@ -186,6 +261,8 @@ export class NotificationRepository {
         createdAt: new Date(),
         updatedAt: new Date(),
       } as unknown as INotificationDocument;
+      this.inMemoryNotifications.set(doc._id.toString(), doc);
+      return doc;
     }
 
     const [notif] = await this.notifModel.create(
@@ -304,6 +381,13 @@ export class NotificationRepository {
     notificationId: Types.ObjectId | string,
     status: NotificationDeliveryStatus,
   ): Promise<void> {
+    if (mongoose.connection.readyState !== 1) {
+      const doc = this.inMemoryNotifications.get(notificationId.toString());
+      if (doc) {
+        doc.deliveryStatus = status;
+      }
+      return;
+    }
     await this.notifModel.updateOne(
       { _id: notificationId },
       { $set: { deliveryStatus: status } },
@@ -319,7 +403,12 @@ export class NotificationRepository {
     session?: ClientSession,
   ): Promise<INotificationOutboxDocument | null> {
     if (mongoose.connection.readyState !== 1) {
-      return {
+      for (const item of this.inMemoryOutbox.values()) {
+        if (item.idempotencyKey === params.idempotencyKey) {
+          return null;
+        }
+      }
+      const doc = {
         _id: new Types.ObjectId(),
         notificationId: new Types.ObjectId(params.notificationId),
         recipientAccountId: new Types.ObjectId(params.recipientAccountId),
@@ -330,7 +419,11 @@ export class NotificationRepository {
         attempts: 0,
         maxAttempts: NOTIFICATION_RULES.MAX_RETRY_ATTEMPTS,
         nextRetryAt: new Date(),
+        createdAt: new Date(),
+        updatedAt: new Date(),
       } as unknown as INotificationOutboxDocument;
+      this.inMemoryOutbox.set(doc._id.toString(), doc);
+      return doc;
     }
 
     try {
@@ -364,6 +457,16 @@ export class NotificationRepository {
     batchSize: number = NOTIFICATION_RULES.BATCH_SIZE,
     referenceNow: Date = new Date(),
   ): Promise<INotificationOutboxDocument[]> {
+    if (mongoose.connection.readyState !== 1) {
+      return Array.from(this.inMemoryOutbox.values())
+        .filter(
+          (item) =>
+            item.status === NOTIFICATION_DELIVERY_STATUSES.PENDING &&
+            new Date(item.nextRetryAt).getTime() <= referenceNow.getTime(),
+        )
+        .slice(0, batchSize);
+    }
+
     return this.outboxModel
       .find({
         status: NOTIFICATION_DELIVERY_STATUSES.PENDING,
@@ -431,6 +534,14 @@ export class NotificationRepository {
       lockedBy?: string | null;
     },
   ): Promise<void> {
+    if (mongoose.connection.readyState !== 1) {
+      const doc = this.inMemoryOutbox.get(outboxId.toString());
+      if (doc) {
+        Object.assign(doc, updates);
+      }
+      return;
+    }
+
     await this.outboxModel.updateOne(
       { _id: outboxId },
       {
@@ -487,6 +598,16 @@ export class NotificationRepository {
     },
   ): Promise<INotificationPreferenceDocument> {
     const accId = typeof accountId === 'string' ? new Types.ObjectId(accountId) : accountId;
+
+    if (mongoose.connection.readyState !== 1) {
+      return {
+        _id: new Types.ObjectId(),
+        accountId: accId,
+        bookingUpdates: updates.bookingUpdates ?? true,
+        paymentUpdates: updates.paymentUpdates ?? true,
+        socialUpdates: updates.socialUpdates ?? true,
+      } as unknown as INotificationPreferenceDocument;
+    }
 
     const pref = await this.prefModel.findOneAndUpdate(
       { accountId: accId },
